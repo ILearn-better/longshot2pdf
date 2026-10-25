@@ -413,12 +413,18 @@ def report(result, interrupted: bool) -> int:
 def _looks_like_input_problem(result, message: str) -> bool:
     """判断失败是「输入/环境不满足」还是「程序异常」。
 
-    pipeline 目前没提供失败阶段字段，只能先看 stage（若有）再退回关键词。
-    这里刻意偏保守：认不出来的一律算运行异常（3），避免把真 bug 报成 2。
+    优先看编排层给的 `RunResult.stage`（pipeline 目前会填 config/probe/capture）：
+    - config / probe → 用户可修正的输入问题，退出码 2
+    - capture        → 采集过程中的意外，退出码 3
+    没有 stage 时（旧接口）退回关键词匹配；认不出来一律算运行异常（3），
+    避免把真 bug 报成 2 而让脚本误以为「改个参数就能好」。
     """
     stage = getattr(result, "stage", None)
-    if stage in ("probe", "validate", "region", "input"):
+    if stage in ("config", "probe", "validate", "region", "input"):
         return True
+    # "done" 是 RunResult 的默认值，等价于「编排层没说是哪一步」，继续看关键词
+    if stage and stage != "done":
+        return False
     keywords = ("不可滚", "不能滚", "滚轮", "探测", "区域", "非法", "无效", "取消")
     return any(k in message for k in keywords)
 

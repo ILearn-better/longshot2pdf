@@ -152,6 +152,14 @@ def _mad(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean())
 
 
+# 残差「偏高但未失败」的判定线。
+# 正常情况下匹配残差 < 1；有固定表头/悬浮按钮压在重叠区上时会抬到 5~10，
+# 但位置依然是对的（只是重叠区被污染了一部分）。这种情况不该中止采集，
+# 而应该**边采边警告**：让用户知道成品可能有重影，下次记得用 strip 剔除。
+# 上界交给 stitch 的 max_error(12)，超过它就直接判失败，不会走到这里。
+DIRTY_ERR = 3.0
+
+
 def _stable_box(region: Region) -> Region:
     """取区域下部一条，用于判断「画面是否还在动」。
 
@@ -331,6 +339,8 @@ def run(
         retries = 0         # 连续匹配失败次数
         coarse_warned = False
         hit_max_pages = False
+        dirty_run = 0       # 连续「残差偏高」的帧数
+        dirty_warned = False
 
         while not stopped and total_frames < cfg.max_frames:
             if should_stop and should_stop():
@@ -381,6 +391,25 @@ def run(
 
             retries = 0
             new_start, delta, _err = loc
+
+            # 残差偏高 = 位置对但重叠区被污染（固定表头压在重叠带上等）。
+            # 不中止，只提醒：中止会让用户拿不到东西，而重影是"能修"的。
+            if _err > DIRTY_ERR:
+                dirty_run += 1
+                if (
+                    dirty_run >= 3
+                    and not dirty_warned
+                    and not (cfg.strip_top or cfg.strip_bottom)
+                ):
+                    dirty_warned = True
+                    report(
+                        total_frames, stitcher.page_count, stitcher.total_rows,
+                        f"警告：连续 {dirty_run} 帧匹配残差偏高（≈{_err:.1f}），"
+                        "区域内可能有固定元素压在重叠带，成品可能有轻微重影；"
+                        "建议用 --strip-top / --strip-bottom 剔除后重采",
+                    )
+            else:
+                dirty_run = 0
 
             if delta <= 0:
                 # 画面完全没变，连续几次才认定到底（一次可能只是加载中）

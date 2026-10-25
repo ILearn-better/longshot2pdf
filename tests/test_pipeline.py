@@ -248,6 +248,30 @@ def case_lazy_loading() -> None:
         print(f"  [OK] 惰性加载（延迟 {delay} 帧）：仍采全 {res.rows} 行 -> {res.pages} 页")
 
 
+def case_dirty_region_warning() -> None:
+    """固定元素只污染了一部分重叠带：位置仍然对，应该继续采但给出质量警告。
+
+    与 case_fixed_footer_guard 的区别：那里污染严重到匹配失败，
+    这里残差升高但仍在可接受范围（<12），内容是全的、只是可能有重影。
+    正确做法是「继续 + 提醒」，中止会让用户白白拿不到东西。
+    """
+    doc = M.make_document(width=640, height=8000)
+    vs = M.VirtualScreen(doc, 800, unit_px=200, footer_rows=30)
+    notes: list[str] = []
+
+    def on_progress(frames, pages, rows, note):
+        if "残差" in note:
+            notes.append(note)
+
+    cfg = CaptureConfig(region=(0, 0, 640, 800), out_path=OUT / "dirty.pdf")
+    res = run(cfg, on_progress=on_progress, deps=make_deps(vs))
+
+    assert res.ok, res.message
+    assert res.rows == doc.shape[0], f"警告不应影响采集完整性，实际 {res.rows} 行"
+    assert notes, "残差偏高却没有发出任何质量警告"
+    print(f"  [OK] 残差偏高：仍采全 {res.rows} 行，并给出 1 次质量警告（不重复刷屏）")
+
+
 def main() -> int:
     shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)

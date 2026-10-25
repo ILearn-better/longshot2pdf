@@ -447,7 +447,11 @@ def main() -> int:
     bar = ttk.Progressbar(box_prog, mode="indeterminate")
     bar.pack(fill="x")
     status_var = tk.StringVar(value="就绪")
-    ttk.Label(box_prog, textvariable=status_var).pack(anchor="w", pady=(8, 0))
+    # 进度 note 可能是长句（探测失败说明、固定元素告警等），必须设 wraplength，
+    # 否则 Label 会按文本宽度撑开整个窗口，用户会看到界面「越跑越宽」。
+    ttk.Label(box_prog, textvariable=status_var, wraplength=580, justify="left").pack(
+        anchor="w", pady=(8, 0)
+    )
     count_var = tk.StringVar(value="帧 0 · 页 0 · 行 0")
     ttk.Label(box_prog, textvariable=count_var, foreground="#555555").pack(anchor="w")
 
