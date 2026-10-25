@@ -260,3 +260,72 @@ class VirtualScreen:
 
     def press_esc(self) -> None:
         self._esc = True
+
+
+class ManualDriver:
+    """模拟「用户自己滚动」：包一层 VirtualScreen，按脚本推进滚动量。
+
+    为什么不能复用 wheel：手动模式下 pipeline **一帧滚轮都不投**，位移必须
+    由屏幕之外产生。真实世界里的触发点是时间（用户想滚就滚），而同步循环里
+    唯一稳定的时间刻度是「整帧抓完」这一刻 —— `_grab_stable()` 每次都拿一次
+    全区域 grab 收尾，所以在这里推进位移，等价于：
+
+        上一帧拍完 → 用户滚了一下 → 下一帧就是新位置
+
+    plan 的每一项就是一次用户动作（像素，正数向下）：
+        [420, 380, 500, ...]   不规则步长（真人不会匀速）
+        [1300]                 一下滚过一屏（超过 view_h，重叠为 0）
+        [-200]                 往上滚
+    plan 用完后不再滚动，相当于用户停手 —— 之后的帧画面不动。
+    """
+
+    def __init__(self, screen: "VirtualScreen", plan) -> None:
+        self.screen = screen
+        # 末尾补一个 0：**最后一次滚动也需要再拍一帧才进得了缓冲区**。
+        # 真实场景里用户滚完总要过一瞬才按停止，这一瞬就是那一帧；
+        # 不补的话「滚完立刻停」会稳定丢掉最后一屏，测试会给出假失败。
+        self.plan = list(plan) + [0]
+        self.i = 0
+        self.scrolled = 0        # 实际执行的滚动次数（不含末尾那次 0）
+        self.offsets: list[int] = [screen.offset]
+
+    # ---- 接口 ----
+    def grab(self, region: tuple[int, int, int, int]) -> np.ndarray:
+        out = self.screen.grab(region)
+        left, top, w, h = (int(v) for v in region)
+        if (w, h) == (self.screen.view_w, self.screen.view_h):
+            self._advance()
+        return out
+
+    def _advance(self) -> None:
+        if self.i >= len(self.plan):
+            return
+        step = int(self.plan[self.i])
+        self.i += 1
+        self.scrolled += 1
+        self.screen.offset = int(
+            min(max(self.screen.offset + step, 0), self.screen.max_offset)
+        )
+        self.offsets.append(self.screen.offset)
+
+    def close(self) -> None:
+        self.screen.close()
+
+    @property
+    def offset(self) -> int:
+        return self.screen.offset
+
+    @property
+    def done(self) -> bool:
+        """脚本里的滚动动作是否已经全部执行完（= 用户停手了）。"""
+        return self.i >= len(self.plan)
+
+
+class WheelProbe:
+    """记录 pipeline 投递过的滚轮，用来断言「手动模式一次都没投」。"""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def wheel(self, steps: int) -> None:
+        self.calls.append(int(steps))

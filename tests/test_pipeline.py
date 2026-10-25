@@ -320,6 +320,157 @@ def case_jitter_adaptive_threshold() -> None:
     )
 
 
+def make_manual_deps(driver: M.ManualDriver, wheel_probe: M.WheelProbe) -> Deps:
+    """手动模式的依赖：滚轮接口故意留成探针，用来断言「一次都没被调用」。"""
+    return Deps(
+        grabber=driver,
+        wheel=wheel_probe.wheel,
+        set_cursor=driver.screen.set_cursor,
+        esc=driver.screen.esc,
+        sleep=lambda s: None,
+    )
+
+
+def case_manual_irregular_steps() -> None:
+    """手动滚动：用户步长不匀、还夹着停顿，内容必须一行不差。"""
+    doc = M.make_document(width=800, height=9000)
+    view_h = 800
+    vs = M.VirtualScreen(doc, view_h, unit_px=100)
+    # 两轮不规则的「用户手感」，总位移超过文档剩余高度（会在底部被夹住）
+    plan = [420, 380, 510, 300, 460, 400, 520, 360, 480, 430] * 2
+    driver = M.ManualDriver(vs, plan)
+    wheel = M.WheelProbe()
+
+    cfg = CaptureConfig(
+        region=(0, 0, 800, view_h),
+        out_path=OUT / "manual.pdf",
+        keep_temp=True,
+        scroll="manual",
+    )
+    res = run(
+        cfg,
+        should_stop=lambda: driver.done,
+        deps=make_manual_deps(driver, wheel),
+    )
+
+    assert res.ok, f"手动模式失败：{res.message}"
+    assert not wheel.calls, f"手动模式不该投递滚轮，却投了 {len(wheel.calls)} 次"
+    assert res.rows == doc.shape[0], (
+        f"手动模式拼接行数 {res.rows} != 文档高度 {doc.shape[0]}"
+    )
+    got = load_pages(res.temp_dir)
+    diff = mad(got, doc)
+    assert diff < 6.0, f"手动模式拼接错位（MAD={diff:.2f}）"
+    print(
+        f"  [OK] 手动滚动：{res.frames} 帧 -> {res.rows} 行 -> {res.pages} 页，"
+        f"零滚轮投递，MAD={diff:.2f}"
+    )
+
+
+def case_manual_overscroll() -> None:
+    """手动模式滚过一屏：不能像自动模式那样替用户滚回去，只能提示 + 认账接续。"""
+    doc = M.make_document(width=800, height=9000)
+    view_h = 800
+    vs = M.VirtualScreen(doc, view_h, unit_px=100)
+    # 第一步就滚 1300px（> 一屏 800px，重叠为 0），之后恢复正常步长
+    plan = [1300] + [400] * 20
+    driver = M.ManualDriver(vs, plan)
+    wheel = M.WheelProbe()
+    notes: list[str] = []
+
+    def on_progress(frames, pages, rows, note):
+        notes.append(note)
+
+    cfg = CaptureConfig(
+        region=(0, 0, 800, view_h),
+        out_path=OUT / "manual_over.pdf",
+        scroll="manual",
+    )
+    res = run(
+        cfg,
+        on_progress=on_progress,
+        should_stop=lambda: driver.done,
+        deps=make_manual_deps(driver, wheel),
+    )
+
+    assert res.ok, f"滚过一屏后应能接续，实际失败：{res.message}"
+    assert not wheel.calls, "手动模式不该投递滚轮"
+    joined = " ".join(notes)
+    assert "接不上" in joined or "漏掉" in joined, (
+        f"滚过一屏却没有给出任何提示，用户会以为内容是全的：{joined[:120]}"
+    )
+    assert "新起点接续" in joined, "连续接不上之后没有认账接续，会永久卡住"
+    # 丢了第一屏之后的内容，所以总行数必然少于全文
+    assert res.rows < doc.shape[0], "声称滚过一屏还能拼出全文，可疑"
+    print(
+        f"  [OK] 滚过一屏：{res.rows} 行（丢了一段）-> {res.pages} 页，"
+        "已提示并接续而不是卡死"
+    )
+
+
+def case_manual_idle_finish() -> None:
+    """手动模式停手：靠「多久没动静」收尾，不能把「画面不动」当成到底。"""
+    doc = M.make_document(width=800, height=9000)
+    view_h = 800
+    vs = M.VirtualScreen(doc, view_h, unit_px=100)
+    driver = M.ManualDriver(vs, [400, 400, 400])   # 滚三次就停手
+    wheel = M.WheelProbe()
+
+    cfg = CaptureConfig(
+        region=(0, 0, 800, view_h),
+        out_path=OUT / "manual_idle.pdf",
+        scroll="manual",
+        # 用一个极小的正数：只要过了任意一点时间就算超时，避免测试依赖真实时钟
+        idle_timeout=1e-9,
+    )
+    res = run(cfg, deps=make_manual_deps(driver, wheel))
+
+    assert res.ok, res.message
+    assert not res.stopped_early, "闲置收尾是正常结束，不该标成中断"
+    assert "没有检测到滚动" in res.message, f"收尾原因不明确：{res.message}"
+    assert 0 < res.rows < doc.shape[0], f"停手时应只有部分内容，实际 {res.rows} 行"
+    print(
+        f"  [OK] 停手收尾：{res.frames} 帧 -> {res.rows} 行 -> {res.pages} 页，"
+        f"结论「{res.message}」"
+    )
+
+
+def case_manual_upward_scroll() -> None:
+    """手动模式往上滚：拼接只能往后追加，必须忽略并说清，不能把内容写乱。"""
+    doc = M.make_document(width=800, height=9000)
+    view_h = 800
+    vs = M.VirtualScreen(doc, view_h, unit_px=100)
+    # 下 400 → 上 200（回看） → 继续往下
+    plan = [400, -200, 400, 400, 400, 400]
+    driver = M.ManualDriver(vs, plan)
+    wheel = M.WheelProbe()
+    notes: list[str] = []
+
+    cfg = CaptureConfig(
+        region=(0, 0, 800, view_h),
+        out_path=OUT / "manual_up.pdf",
+        keep_temp=True,
+        scroll="manual",
+    )
+    res = run(
+        cfg,
+        on_progress=lambda f, p, r, n: notes.append(n),
+        should_stop=lambda: driver.done,
+        deps=make_manual_deps(driver, wheel),
+    )
+
+    assert res.ok, res.message
+    assert any("向上滚动" in n for n in notes), "往上滚没有提示，用户不知道那帧被忽略了"
+    # 关键：回看不能被写进 PDF —— 内容必须严格递增、不重复
+    got = load_pages(res.temp_dir)
+    expect = doc[: got.shape[0]]
+    diff = mad(got, expect)
+    assert diff < 6.0, f"往上滚之后拼接错乱（MAD={diff:.2f}），可能把回看内容追加进去了"
+    print(
+        f"  [OK] 向上滚动：已忽略并提示，{res.rows} 行内容仍严格递增（MAD={diff:.2f}）"
+    )
+
+
 def main() -> int:
     shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)
@@ -337,6 +488,10 @@ def main() -> int:
     case_lazy_loading()
     case_dirty_region_warning()
     case_jitter_adaptive_threshold()
+    case_manual_irregular_steps()
+    case_manual_overscroll()
+    case_manual_idle_finish()
+    case_manual_upward_scroll()
     print("全部通过")
     return 0
 

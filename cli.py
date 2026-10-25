@@ -50,6 +50,8 @@ DEFAULTS = {
     "quality": 85,
     "page_ratio": 1.414,
     "max_frames": 20000,
+    "scroll": "auto",
+    "idle_timeout": 60.0,
 }
 
 # 用 typing.Tuple 而不是内置 tuple[...]：别名是**运行期求值**的，写 tuple[...]
@@ -311,6 +313,8 @@ def make_config(region: Region, out_path: Path, args) -> tuple[object, list[str]
         "max_frames": args.max_frames,
         "max_pages": args.max_pages,
         "keep_temp": args.keep_temp,
+        "scroll": "manual" if getattr(args, "manual", False) else "auto",
+        "idle_timeout": float(getattr(args, "idle_timeout", 60.0) or 0.0),
     }
     fields = {f.name for f in dataclasses.fields(CaptureConfig)}
     ignored = sorted(set(desired) - fields)
@@ -437,15 +441,27 @@ def print_dry_run(region: Region, out_path: Path, args, ignored: list[str]) -> N
     page_h = int(round(width * args.page_ratio))
     step = max(1, int(round(height * (1.0 - args.overlap))))
     frames_per_page = max(1, -(-page_h // step))  # 向上取整
+    manual = bool(getattr(args, "manual", False))
 
     print("== 干跑（不截图、不滚轮、不写文件） ==")
     print(f"区域      : left={left} top={top} width={width} height={height}（物理像素）")
     print(f"输出       : {out_path}")
     print(f"单页像素   : {width} × {page_h}（页比例 {args.page_ratio}）")
-    print(
-        f"滚动步长   : 视口 {height}px × (1 - 重叠 {args.overlap}) ≈ {step}px"
-        f" → 约 {frames_per_page} 帧出 1 页"
-    )
+    if manual:
+        print("滚动方式   : 手动 —— 程序不投滚轮，你自己滚，它只抓帧拼接")
+        print(
+            f"收尾条件   : 按 ESC / 点停止；或 "
+            + (f"{args.idle_timeout:.0f}s 无滚动自动收尾" if args.idle_timeout else "一直等你停")
+        )
+        print(
+            f"提醒       : 每次滚动别超过 {height}px（一屏），超过了那一帧接不上，"
+            "中间会漏一段"
+        )
+    else:
+        print(
+            f"滚动步长   : 视口 {height}px × (1 - 重叠 {args.overlap}) ≈ {step}px"
+            f" → 约 {frames_per_page} 帧出 1 页"
+        )
     print(
         "估算页数   : 取决于目标文档总高度（无法预知），"
         f"每页 {page_h}px；若文档高 H px，页数 ≈ ceil(H / {page_h})"
@@ -459,7 +475,14 @@ def print_dry_run(region: Region, out_path: Path, args, ignored: list[str]) -> N
     print(f"保留临时页 : {'是（调试）' if args.keep_temp else '否'}")
     for name in ignored:
         print(f"注意       : 当前 pipeline 尚未支持 --{name.replace('_', '-')}，本次忽略")
-    print("将执行     : 探测能否滚动 → 采集首帧 → 校准滚轮步长 → 循环采集并分页 → 合成 PDF")
+    print(
+        "将执行     : "
+        + (
+            "采集首帧 → 循环抓帧并比对拼接（等你滚） → 分页 → 合成 PDF"
+            if manual
+            else "探测能否滚动 → 采集首帧 → 校准滚轮步长 → 循环采集并分页 → 合成 PDF"
+        )
+    )
 
 
 # --------------------------------------------------------------------- 端到端自测
@@ -756,6 +779,7 @@ def build_parser() -> argparse.ArgumentParser:
             "示例：\n"
             "  python cli.py --region 100,200,1200,900 --out 文档.pdf\n"
             "  python cli.py --select --overlap 0.2\n"
+            "  python cli.py --select --manual              # 你自己滚，它只负责拼\n"
             "  python cli.py --fullscreen --max-pages 300 --quiet\n"
             "  python cli.py --dry-run --region 0,0,800,600 --out /tmp/x.pdf\n"
             "  python cli.py --selftest\n"
@@ -800,6 +824,13 @@ def build_parser() -> argparse.ArgumentParser:
                         default=0, metavar="N", help="达到页数自动收尾，0=不限（默认）")
     parser.add_argument("--keep-temp", dest="keep_temp", action="store_true",
                         help="保留中间页 JPEG（调试用，正常会清理）")
+    parser.add_argument("--manual", dest="manual", action="store_true",
+                        help="手动滚动：程序不投滚轮，你自己滚，它只负责抓帧拼接"
+                             "（适合要看一眼再滚、或程序不吃合成滚轮）")
+    parser.add_argument("--idle-timeout", dest="idle_timeout", type=float,
+                        default=DEFAULTS["idle_timeout"], metavar="S",
+                        help="仅 --manual：多少秒没有滚动就自动收尾，0 = 一直等"
+                             "（默认 60）")
     parser.add_argument("--quiet", action="store_true", help="不打印进度行")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="只打印将要做什么（区域/估算页数/输出路径），不截图")

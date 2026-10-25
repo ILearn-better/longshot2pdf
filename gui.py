@@ -433,6 +433,22 @@ def main() -> int:
     add_spin(5, "底部剔除", strip_bottom_var, 0, 10000, "像素，裁掉状态栏/悬浮按钮")
     add_spin(6, "最大页数", max_pages_var, 0, 100000, "0 = 不限；>0 达到即收尾")
 
+    # ---- 滚动方式 ----
+    # 拼接是纯内容比对的，不关心位移是谁造成的，所以两种模式只差「谁滚」。
+    scroll_var = tk.StringVar(value="auto")
+    ttk.Label(box_param, text="滚动方式").grid(row=7, column=0, sticky="w", pady=3)
+    radio_row = ttk.Frame(box_param)
+    radio_row.grid(row=7, column=1, columnspan=3, sticky="w", padx=8)
+    rb_auto = ttk.Radiobutton(radio_row, text="自动", value="auto", variable=scroll_var)
+    rb_auto.pack(side="left")
+    rb_manual = ttk.Radiobutton(radio_row, text="手动（我自己滚）", value="manual",
+                                variable=scroll_var)
+    rb_manual.pack(side="left", padx=(12, 0))
+    param_widgets.extend([rb_auto, rb_manual])
+
+    idle_var = tk.IntVar(value=60)
+    add_spin(8, "无滚动收尾", idle_var, 0, 3600, "秒，仅手动模式；0 = 一直等（按 ESC 结束）")
+
     # ---------------- 操作 ----------------
     box_action = ttk.Frame(outer)
     box_action.pack(fill="x", pady=(12, 0))
@@ -454,6 +470,23 @@ def main() -> int:
     )
     count_var = tk.StringVar(value="帧 0 · 页 0 · 行 0")
     ttk.Label(box_prog, textvariable=count_var, foreground="#555555").pack(anchor="w")
+
+    def on_scroll_mode_changed(*_args) -> None:
+        """切换滚动方式时改按钮文案和提示。
+
+        文案要改是因为两种模式下「开始」之后发生的事完全不同：
+        自动模式点完就不用管了，手动模式点完才是用户开始干活的时候。
+        """
+        if state["running"]:
+            return
+        if str(scroll_var.get()) == "manual":
+            btn_start.configure(text="开始采集（之后你自己滚）")
+            status_var.set("手动模式：开始后由你滚动页面，程序只负责抓帧拼接")
+        else:
+            btn_start.configure(text="开始滚动截图")
+            status_var.set("就绪")
+
+    scroll_var.trace_add("write", on_scroll_mode_changed)
 
     box_done = ttk.Frame(box_prog)
     box_done.pack(fill="x", pady=(10, 0))
@@ -507,7 +540,9 @@ def main() -> int:
         widgets = list(param_widgets) + [btn_select, btn_browse, entry_out, btn_start]
         for widget in widgets:
             try:
-                if isinstance(widget, (ttk.Scale, ttk.Spinbox, ttk.Entry, ttk.Button)):
+                if isinstance(
+                    widget, (ttk.Scale, ttk.Spinbox, ttk.Entry, ttk.Button, ttk.Radiobutton)
+                ):
                     widget.state(["!disabled"] if enabled else ["disabled"])
             except Exception:  # noqa: BLE001
                 pass
@@ -525,6 +560,8 @@ def main() -> int:
             "max_pages": int(max_pages_var.get()),
             "max_frames": 20000,
             "keep_temp": False,
+            "scroll": str(scroll_var.get() or "auto"),
+            "idle_timeout": float(idle_var.get() or 0),
         }
 
     def worker(cfg, q: queue.Queue, stop_evt: threading.Event) -> None:
@@ -567,7 +604,9 @@ def main() -> int:
         out_var.set(str(out_path))
 
         values = collect_params()
-        if not (0.02 <= values["overlap"] <= 0.6):
+        manual = values.get("scroll") == "manual"
+        # 重叠只在自动模式下决定步长；手动模式的位移是用户给的，校验它没有意义
+        if not manual and not (0.02 <= values["overlap"] <= 0.6):
             messagebox.showerror("参数不合法", "滚动重叠必须在 0.02~0.6 之间。")
             return
 
@@ -588,7 +627,11 @@ def main() -> int:
         btn_stop.state(["!disabled"])
         btn_open.state(["disabled"])
         result_var.set("")
-        status_var.set("正在检测该位置是否响应滚轮…")
+        status_var.set(
+            "手动模式：现在请自己滚动页面，采完按 ESC 或点「停止」"
+            if manual
+            else "正在检测该位置是否响应滚轮…"
+        )
         count_var.set("帧 0 · 页 0 · 行 0")
         bar.start(12)
 

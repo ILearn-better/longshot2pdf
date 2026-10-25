@@ -30,6 +30,7 @@
     python run.py --doctor          # 环境体检：逐个解释器 + 依赖 + 截图 + DPI
     python run.py --region 100,200,1200,900 --out 长图.pdf
     python run.py --select          # 框选后命令行采集
+    python run.py --manual --select # 手动滚：你自己滚，它只负责抓帧拼接
     python run.py --venv            # 在 .venv 里重建隔离环境后启动
     python run.py --no-install      # 只诊断，不尝试装依赖
     python run.py --no-switch       # 不要自动换解释器

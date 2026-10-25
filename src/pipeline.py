@@ -11,6 +11,19 @@
    必须马上变成可打开的 PDF。500 页滚到第 400 页崩了却什么都不给，等于全废。
 3) **探测的实测值要复用**。probe 已经测出「一格滚轮 = 多少像素」，
    编排层如果还要再滚一格重新校准，等于白滚一次、多一次起始位置漂移的机会。
+
+两种滚动模式（cfg.scroll）
+-------------------------
+拼接算法是**纯内容比对**的（locate 只看两张图的重叠），它根本不知道位移
+是谁造成的。所以「手动滚动」不需要改算法，只需要改一件事：**谁产生位移**。
+
+    auto    程序每帧投递滚轮，步长按实测 unit_px 校准，滚到底自动收尾。
+    manual  程序一帧都不投，只抓帧比对；位移全由用户产生。
+
+由此派生出三处必须区别对待的地方，写在各分支的注释里：
+    · 手动模式**不跑 probe**（probe 会滚下去再滚回来，会在用户眼皮底下动页面）；
+    · 手动模式**不替用户滚回去**（位移是他的意图），接不上只能提示他回滚；
+    · 手动模式**不恢复光标**（我们没动过它，用户可能已经自己挪走了）。
 """
 
 from __future__ import annotations
@@ -51,6 +64,13 @@ class CaptureConfig:
     max_frames: int = 20000        # 安全上限，防止死循环
     max_pages: int = 0             # 0 = 不限；>0 时达到页数即收尾
     keep_temp: bool = False        # 保留中间页 JPEG（调试用）
+    # 滚动由谁发起：
+    #   "auto"   程序每帧投递滚轮，步长按 probe 实测值校准（默认，适合长文档一口气拉完）
+    #   "manual" 用户自己滚，程序只负责抓帧和拼接（适合要看一眼再滚、或程序不吃合成滚轮）
+    scroll: str = "auto"
+    # 仅 manual：多少秒没有检测到新内容就收尾。0 = 一直等，只由用户按停。
+    # 不能靠「画面不动了」判结束 —— 用户停下来读一段话和滚到底，画面是一模一样的。
+    idle_timeout: float = 60.0
 
 
 @dataclass
@@ -183,6 +203,19 @@ DIRTY_ERR = 3.0
 DIRTY_JITTER_GAIN = 2.5
 
 
+# 手动模式下「这一帧接不上」的容忍度。
+#
+# 自动模式接不上时，编排层可以替用户滚回去再试（它本来就是滚动的发起者）。
+# 手动模式不行 —— 位移是用户的意图，替他又滚一下只会更乱。能做的只有两件事：
+#   1) 先提示「往回滚一点」：只要用户回滚，下一帧就能重新接上，一行不丢；
+#   2) 连续很多帧还是接不上，才认账：以当前画面为新起点接续，并明确报告丢失。
+# 不这么做的话，用户随便一次大幅滚动就会永久卡死（prev 永远对不上新画面）。
+#
+# 一轮手动循环 ≈ settle_ms + 抓帧 ≈ 250ms，所以 3 ≈ 0.8s（够回滚了），12 ≈ 3s。
+MANUAL_LOST_HINT = 3
+MANUAL_LOST_GIVE_UP = 12
+
+
 def _stable_box(region: Region) -> Region:
     """取区域下部一条，用于判断「画面是否还在动」。
 
@@ -250,6 +283,8 @@ def run(
 
     d.enable_dpi()
 
+    manual = str(getattr(cfg, "scroll", "auto") or "auto").lower() == "manual"
+
     # ---------- 0. 区域与输出 ----------
     region: Region = tuple(int(v) for v in cfg.region)  # type: ignore[assignment]
     if cfg.strip_top or cfg.strip_bottom:
@@ -288,45 +323,54 @@ def run(
     cursor_before = d.save_cursor()
 
     try:
-        # ---------- 1. 探测能否滚动 ----------
-        report(0, 0, 0, "正在检测该位置是否响应滚轮…")
-        pr = probe(
-            grabber,
-            region,
-            cfg.settle_ms,
-            wheel_fn=d.wheel,
-            set_cursor_fn=d.set_cursor,
-        )
-        if not pr.scrollable:
-            return RunResult(False, stage="probe", message=pr.note)
-        if pr.direction == "up":
-            # 探测确认能滚，但只有在底部时才向上有反应：直接开始会立刻到底
-            return RunResult(False, stage="probe", message=pr.note)
-
-        hot = pr.hot_point
-        d.set_cursor(*hot)
-        d.sleep(0.05)
-
-        # 探测靠「滚下去再滚回来」判断能否滚动，归位不准的后果不是失败而是
-        # **悄悄从偏移后的位置开始截**，用户拿到的 PDF 开头会缺一小段。
-        # 这里不能静默，必须在进度里说出来。
-        if not getattr(pr, "restored", True):
-            report(
-                0, 0, 0,
-                "警告：探测未能确认滚动位置已完全归位，起始位置可能有轻微偏移",
+        # ---------- 1. 探测能否滚动（手动模式整段跳过） ----------
+        pr = None
+        if manual:
+            # 手动模式下绝不能跑 probe：它会「滚下去再滚回来」，
+            # 那等于在用户眼皮底下把页面动一下；而此时用户可能正握着滚轮，
+            # 两边一起滚必然归位不准，换来的却只是他根本不需要的 unit_px。
+            report(0, 0, 0, "手动模式：请自己滚动页面，采完按 ESC 或点「停止」")
+        else:
+            report(0, 0, 0, "正在检测该位置是否响应滚轮…")
+            pr = probe(
+                grabber,
+                region,
+                cfg.settle_ms,
+                wheel_fn=d.wheel,
+                set_cursor_fn=d.set_cursor,
             )
+            if not pr.scrollable:
+                return RunResult(False, stage="probe", message=pr.note)
+            if pr.direction == "up":
+                # 探测确认能滚，但只有在底部时才向上有反应：直接开始会立刻到底
+                return RunResult(False, stage="probe", message=pr.note)
+
+            hot = pr.hot_point
+            d.set_cursor(*hot)
+            d.sleep(0.05)
+
+            # 探测靠「滚下去再滚回来」判断能否滚动，归位不准的后果不是失败而是
+            # **悄悄从偏移后的位置开始截**，用户拿到的 PDF 开头会缺一小段。
+            # 这里不能静默，必须在进度里说出来。
+            if not getattr(pr, "restored", True):
+                report(
+                    0, 0, 0,
+                    "警告：探测未能确认滚动位置已完全归位，起始位置可能有轻微偏移",
+                )
 
         # ---------- 2. 首帧 ----------
-        report(0, 0, 0, "探测通过，正在采集首帧…")
+        report(0, 0, 0, "正在采集首帧…")
         prev, _jit = _grab_stable(d, region, cfg.settle_ms)
         stitcher.append(prev)
         total_frames = 1
 
-        # ---------- 3. 校准：一格滚轮 = 多少像素 ----------
+        # ---------- 3. 校准：一格滚轮 = 多少像素（手动模式无步长可校准） ----------
         target_step = region[3] * (1.0 - cfg.overlap)
-        unit_px = float(getattr(pr, "unit_px", 0.0) or 0.0)
+        unit_px = float(getattr(pr, "unit_px", 0.0) or 0.0) if pr is not None else 0.0
         steps = 1
-        if unit_px > 0:
+        if manual:
+            last_note = ""
+        elif unit_px > 0:
             # probe 已经实测过，直接换算，省掉一次多余的滚动
             steps = max(1, min(50, int(round(target_step / unit_px))))
             last_note = (
@@ -358,7 +402,8 @@ def run(
         # 相邻帧重叠为 0，拼接算法在数学上无解 —— 不是参数没调好。
         # 与其滚 3 次、失败 3 次、最后甩一句含糊的「匹配失败」，
         # 不如立刻说清原因和可选做法，并把首帧出一页。
-        grain_too_coarse = unit_px >= region[3] * 0.98
+        # 手动模式没有「一格」的概念，这条判定不适用。
+        grain_too_coarse = (not manual) and unit_px >= region[3] * 0.98
         if grain_too_coarse:
             stopped = True
             last_note = (
@@ -369,112 +414,46 @@ def run(
             report(total_frames, stitcher.page_count, stitcher.total_rows, last_note)
 
         # ---------- 4. 主循环 ----------
-        stalls = 0          # 连续「滚了但画面没动」的次数
-        retries = 0         # 连续匹配失败次数
-        coarse_warned = False
-        hit_max_pages = False
-        dirty_run = 0       # 连续「残差偏高」的帧数
-        dirty_warned = False
+        # 两种模式共用的「收下一帧」：写分页缓冲 + 质量判定 + 进度上报。
+        # 抽出来是为了让两个循环只关心「位移是怎么来的」，不各写一遍质量逻辑。
+        dirty = {"run": 0, "warned": False, "coarse": False}
 
-        while not stopped and total_frames < cfg.max_frames:
-            if should_stop and should_stop():
-                last_note = "已手动停止"
-                stopped = True
-                break
-            if d.esc():
-                last_note = "检测到 ESC，已停止"
-                stopped = True
-                break
-            if cfg.max_pages and stitcher.page_count >= cfg.max_pages:
-                last_note = f"已达页数上限 {cfg.max_pages}，正常收尾"
-                hit_max_pages = True
-                break
-
-            d.wheel(-steps)
-            cur, jitter = _grab_stable(d, region, cfg.settle_ms)
-            loc = locate(prev, cur)
-
-            if loc is None:
-                # 多半滚过头了（一帧内位移超过一屏，重叠为 0）：
-                # 先滚回去，再减半步长重试。宁可重滚也不要写入错位内容。
-                retries += 1
-                if retries > 3:
-                    last_note = (
-                        "连续匹配失败（滚动粒度过大或界面重绘），已停止；"
-                        "已采集部分会正常导出"
-                    )
-                    # 最常见的真实原因不是「滚过头」，而是框选区域里混进了
-                    # 固定表头 / 悬浮按钮 / 状态栏：它们在每帧的同一位置重复出现，
-                    # 会让重叠区永远对不上。这时减步长再怎么试都没用，
-                    # 必须让用户去剔除固定条，否则他会以为是程序坏了。
-                    if not (cfg.strip_top or cfg.strip_bottom):
-                        last_note += (
-                            "。若截图区域内含固定表头、底栏、悬浮按钮或滚动条，"
-                            "请用 --strip-top / --strip-bottom 剔除后重试"
-                        )
-                    stopped = True
-                    break
-                d.wheel(steps)          # 滚回
-                d.sleep(0.15)
-                steps = max(1, steps // 2)
-                report(
-                    total_frames, stitcher.page_count, stitcher.total_rows,
-                    f"匹配失败，步长降为 {steps} 格后重试",
-                )
-                continue
-
-            retries = 0
-            new_start, delta, _err = loc
-
+        def accept(cur: np.ndarray, new_start: int, delta: int,
+                   err: float, jitter: float) -> None:
+            nonlocal prev, total_frames
             # 残差偏高 = 位置对但重叠区被污染（固定表头压在重叠带上等）。
             # 不中止，只提醒：中止会让用户拿不到东西，而重影是"能修"的。
             # 判定线随画面自身抖动抬升：视频缩略图/加载动画这类天然在动的区域，
             # 残差本来就高，固定门槛会一直误报。
             err_level = max(DIRTY_ERR, DIRTY_JITTER_GAIN * jitter)
-            if _err > err_level:
-                dirty_run += 1
+            if err > err_level:
+                dirty["run"] += 1
                 if (
-                    dirty_run >= 3
-                    and not dirty_warned
+                    dirty["run"] >= 3
+                    and not dirty["warned"]
                     and not (cfg.strip_top or cfg.strip_bottom)
                 ):
-                    dirty_warned = True
+                    dirty["warned"] = True
                     report(
                         total_frames, stitcher.page_count, stitcher.total_rows,
-                        f"警告：连续 {dirty_run} 帧匹配残差偏高（≈{_err:.1f}），"
+                        f"警告：连续 {dirty['run']} 帧匹配残差偏高（≈{err:.1f}），"
                         "区域内可能有固定元素压在重叠带，成品可能有轻微重影；"
                         "建议用 --strip-top / --strip-bottom 剔除后重采",
                     )
             else:
-                dirty_run = 0
+                dirty["run"] = 0
 
-            if delta <= 0:
-                # 画面完全没变，连续几次才认定到底（一次可能只是加载中）
-                stalls += 1
-                if stalls >= 2:
-                    last_note = "已滚动到底部，采集结束"
-                    break
-                d.sleep(0.12)
-                continue
-
-            stalls = 0
             stitcher.append(cur[new_start:])
             prev = cur
             total_frames += 1
 
             # 重叠不足会直接导致拼接风险，必须让用户知道
-            if not coarse_warned and delta >= region[3] * 0.95:
-                coarse_warned = True
+            if not dirty["coarse"] and delta >= region[3] * 0.95:
+                dirty["coarse"] = True
                 report(
                     total_frames, stitcher.page_count, stitcher.total_rows,
                     "警告：单帧位移接近整屏，重叠不足 5%，拼接可能断连",
                 )
-
-            # 步长自适应微调：目标是一帧走 target_step
-            if delta > target_step * 1.35 and steps > 1:
-                steps -= 1
-            elif delta < target_step * 0.65 and steps < 50:
-                steps += 1
 
             report(
                 total_frames,
@@ -483,6 +462,175 @@ def run(
                 f"已采集 {total_frames} 帧 · {stitcher.total_rows} 行 "
                 f"· {stitcher.page_count} 页 · 本帧位移 {delta}px",
             )
+
+        hit_max_pages = False
+
+        if manual:
+            # ================= 手动滚动 =================
+            # 循环里**不投递任何滚轮**，只抓帧、比对、追加。位移完全由用户产生，
+            # 所以这里既不能替他滚回去，也不能替他减步长。
+            lost = 0                              # 连续「接不上」的帧数
+            idle_timeout = float(getattr(cfg, "idle_timeout", 60.0) or 0.0)
+            last_move = time.monotonic()
+            waiting = False
+
+            while not stopped and total_frames < cfg.max_frames:
+                if should_stop and should_stop():
+                    last_note = "已手动停止"
+                    stopped = True
+                    break
+                if d.esc():
+                    last_note = "检测到 ESC，已停止"
+                    stopped = True
+                    break
+                if cfg.max_pages and stitcher.page_count >= cfg.max_pages:
+                    last_note = f"已达页数上限 {cfg.max_pages}，正常收尾"
+                    hit_max_pages = True
+                    break
+
+                cur, jitter = _grab_stable(d, region, cfg.settle_ms)
+                loc = locate(prev, cur)
+
+                if loc is None:
+                    # 反过来比一次：如果 prev 的内容出现在 cur 里面，说明用户往上滚了。
+                    # 流式拼接只能往后追加（前插要重排已写好的页），所以只能丢弃，
+                    # 但必须说出来，否则用户会以为回看的那段也进了 PDF。
+                    back = locate(cur, prev)
+                    if back is not None and back[1] > 0:
+                        lost = 0
+                        report(
+                            total_frames, stitcher.page_count, stitcher.total_rows,
+                            "检测到向上滚动：拼接只支持往下追加，这一帧已忽略；"
+                            "继续往下滚即可，或按 ESC 结束",
+                        )
+                        continue
+
+                    lost += 1
+                    if lost < MANUAL_LOST_GIVE_UP:
+                        if lost == MANUAL_LOST_HINT:
+                            report(
+                                total_frames, stitcher.page_count, stitcher.total_rows,
+                                "这一帧和上一帧接不上（一次滚得超过一屏）。"
+                                "往回滚一点就能继续接上；不管它的话中间这段会丢",
+                            )
+                        continue
+
+                    # 认账：中间那段确实采不到，以当前画面为新起点接续。
+                    # 不认账的话 prev 永远对不上，用户就永久卡在这里了。
+                    n_lost = lost
+                    lost = 0
+                    last_note = "滚动幅度超过一屏，中间内容未采到"
+                    report(
+                        total_frames, stitcher.page_count, stitcher.total_rows,
+                        f"警告：连续 {n_lost} 帧接不上，已把当前画面作为新起点接续；"
+                        "两段之间漏掉的内容没有采到",
+                    )
+                    stitcher.append(cur)
+                    prev = cur
+                    total_frames += 1
+                    last_move = time.monotonic()
+                    continue
+
+                new_start, delta, err = loc
+
+                if delta <= 0:
+                    # 画面没动 = 用户停下来了。
+                    # 这在手动模式下**不能**当成「已到底」：用户停下来读一段话
+                    # 和滚到最底部，画面是一模一样的，靠位移无从区分。
+                    # 只能按「多久没动静」收尾，时长交给用户配（--idle-timeout）。
+                    if idle_timeout > 0:
+                        idle = time.monotonic() - last_move
+                        if idle >= idle_timeout:
+                            last_note = (
+                                f"已 {idle_timeout:g}s 没有检测到滚动，正常收尾"
+                            )
+                            break
+                        if not waiting:
+                            waiting = True
+                            report(
+                                total_frames, stitcher.page_count, stitcher.total_rows,
+                                f"等待滚动…（{idle_timeout:g}s 无动作将自动收尾，"
+                                "也可按 ESC 或点「停止」立即结束）",
+                            )
+                    continue
+
+                lost = 0
+                waiting = False
+                last_move = time.monotonic()
+                accept(cur, new_start, delta, err, jitter)
+
+        else:
+            # ================= 自动滚动 =================
+            stalls = 0          # 连续「滚了但画面没动」的次数
+            retries = 0         # 连续匹配失败次数
+
+            while not stopped and total_frames < cfg.max_frames:
+                if should_stop and should_stop():
+                    last_note = "已手动停止"
+                    stopped = True
+                    break
+                if d.esc():
+                    last_note = "检测到 ESC，已停止"
+                    stopped = True
+                    break
+                if cfg.max_pages and stitcher.page_count >= cfg.max_pages:
+                    last_note = f"已达页数上限 {cfg.max_pages}，正常收尾"
+                    hit_max_pages = True
+                    break
+
+                d.wheel(-steps)
+                cur, jitter = _grab_stable(d, region, cfg.settle_ms)
+                loc = locate(prev, cur)
+
+                if loc is None:
+                    # 多半滚过头了（一帧内位移超过一屏，重叠为 0）：
+                    # 先滚回去，再减半步长重试。宁可重滚也不要写入错位内容。
+                    retries += 1
+                    if retries > 3:
+                        last_note = (
+                            "连续匹配失败（滚动粒度过大或界面重绘），已停止；"
+                            "已采集部分会正常导出"
+                        )
+                        # 最常见的真实原因不是「滚过头」，而是框选区域里混进了
+                        # 固定表头 / 悬浮按钮 / 状态栏：它们在每帧的同一位置重复出现，
+                        # 会让重叠区永远对不上。这时减步长再怎么试都没用，
+                        # 必须让用户去剔除固定条，否则他会以为是程序坏了。
+                        if not (cfg.strip_top or cfg.strip_bottom):
+                            last_note += (
+                                "。若截图区域内含固定表头、底栏、悬浮按钮或滚动条，"
+                                "请用 --strip-top / --strip-bottom 剔除后重试"
+                            )
+                        stopped = True
+                        break
+                    d.wheel(steps)          # 滚回
+                    d.sleep(0.15)
+                    steps = max(1, steps // 2)
+                    report(
+                        total_frames, stitcher.page_count, stitcher.total_rows,
+                        f"匹配失败，步长降为 {steps} 格后重试",
+                    )
+                    continue
+
+                retries = 0
+                new_start, delta, err = loc
+
+                if delta <= 0:
+                    # 画面完全没变，连续几次才认定到底（一次可能只是加载中）
+                    stalls += 1
+                    if stalls >= 2:
+                        last_note = "已滚动到底部，采集结束"
+                        break
+                    d.sleep(0.12)
+                    continue
+
+                stalls = 0
+                accept(cur, new_start, delta, err, jitter)
+
+                # 步长自适应微调：目标是一帧走 target_step
+                if delta > target_step * 1.35 and steps > 1:
+                    steps -= 1
+                elif delta < target_step * 0.65 and steps < 50:
+                    steps += 1
 
         # ---------- 5. 收尾 ----------
         finished = True
@@ -539,7 +687,10 @@ def run(
             False, stage="capture", message=f"采集异常：{type(exc).__name__}: {exc}"
         )
     finally:
-        d.restore_cursor(cursor_before)
+        # 手动模式下我们从没动过光标，就别去"恢复"它 ——
+        # 采集期间用户可能已经自己挪了鼠标，最后再拉回起点纯属添乱。
+        if not manual:
+            d.restore_cursor(cursor_before)
         if owned_grabber:
             try:
                 grabber.close()
