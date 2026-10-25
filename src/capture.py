@@ -58,9 +58,20 @@ def normalize_region(region: Region, screen: Region | None = None) -> Region:
     return (x0, y0, cw, ch)
 
 
+def _new_sct():
+    """创建一个 mss 截屏会话。
+
+    mss 10.2 起 `mss.mss()` 已弃用、`MSS` 类取而代之，直接调用会在每次创建时
+    往 stderr 打一行 DeprecationWarning —— 而截图是每帧都做的事，这行警告会
+    把真正的错误挤出终端。所以优先用新 API，旧版本回退。
+    """
+    factory = getattr(mss, "MSS", None) or getattr(mss, "mss")
+    return factory()
+
+
 class Grabber:
     def __init__(self) -> None:
-        self._sct: mss.base.MSSBase | None = mss.mss()
+        self._sct: mss.base.MSSBase | None = _new_sct()
 
     def grab(self, region: Region) -> np.ndarray:
         """截取区域，返回 (H, W, 3) uint8 RGB 数组。
