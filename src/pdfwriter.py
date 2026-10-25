@@ -157,3 +157,72 @@ def pages_total_size(pages: Iterable[Path]) -> int:
         except OSError:
             continue
     return total
+
+
+def images_to_pdf(
+    images,
+    out_path: Path,
+    *,
+    page_w_pt: float = A4_WIDTH_PT,
+    quality: int = 85,
+) -> Path:
+    """一组**尺寸各不相同**的图片 → 多页 PDF，每页按自己的比例出。
+
+    与 `jpegs_to_pdf` 的区别：那个是给长截图用的，所有页共用一个 page_ratio
+    （因为拼出来本来就是等宽的连续页）；连续截图整合里的每张图长宽比都不一样，
+    共用比例会让 img2pdf 把图拉伸或套黑边。这里给 img2pdf 一个**按页算**的
+    layout_fun，页宽固定、页高按本页像素比例算，于是：
+        · 所有页物理宽度一致（阅读器里翻页不会忽大忽小）；
+        · 每页高度跟着图走（不裁、不拉伸、不套边）。
+    """
+    import tempfile
+
+    from PIL import Image
+
+    images = list(images)
+    if not images:
+        raise ValueError("没有可输出的页，无法生成 PDF")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="longshot_pages_"))
+    try:
+        paths = []
+        for i, img in enumerate(images, start=1):
+            p = tmp_dir / f"{i:04d}.jpg"
+            Image.fromarray(img).save(p, "JPEG", quality=int(quality), subsampling=0)
+            paths.append(p)
+
+        def layout(imgwidthpx, imgheightpx, ndpi):
+            # img2pdf 的 layout_fun 收 (宽px, 高px, (xdpi, ydpi))，必须返回四个值：
+            # (页宽, 页高, 图片绘制宽, 图片绘制高)，单位都是 pt。
+            # 只用像素比例算，不用 ndpi —— 截图的 DPI 元数据不可信（各工具写得不一），
+            # 拿它折算会算出离谱的页高。
+            w = float(page_w_pt)
+            h = w * (float(imgheightpx) / float(imgwidthpx))
+            if h > PDF_MAX_PAGE_PT:      # 极长图：等比缩小，避免阅读器打不开
+                scale = PDF_MAX_PAGE_PT / h
+                w *= scale
+                h = PDF_MAX_PAGE_PT
+            if w > PDF_MAX_PAGE_PT:
+                scale = PDF_MAX_PAGE_PT / w
+                w = PDF_MAX_PAGE_PT
+                h *= scale
+            # 绘制尺寸 == 页尺寸：页比例本来就是按这张图算的，铺满即不变形
+            return (w, h, w, h)
+
+        try:
+            with open(out_path, "wb") as fh:
+                img2pdf.convert(
+                    [str(p) for p in paths], layout_fun=layout, outputstream=fh
+                )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"合并 PDF 失败（{len(paths)} 页 → {out_path}）："
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out_path

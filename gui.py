@@ -317,10 +317,10 @@ def main() -> int:
     winapi.enable_dpi_awareness()
 
     root = tk.Tk()
-    base_title = "LongShot2PDF · 滚动截长图转 PDF"
+    base_title = "LongShot2PDF · 滚动截长图 / 连续截图整合"
     root.title(base_title)
-    root.geometry("660x760")
-    root.minsize(620, 700)
+    root.geometry("700x820")
+    root.minsize(660, 760)
 
     style = ttk.Style(root)
     for theme in ("vista", "winnative", "clam"):
@@ -331,6 +331,19 @@ def main() -> int:
             continue
     style.configure("Title.TLabel", font=("Microsoft YaHei", 13, "bold"))
     style.configure("Start.TButton", font=("Microsoft YaHei", 12, "bold"))
+
+    # ---------------- 顶部导航 ----------------
+    # 两个功能同级挂在 Notebook 上：一个负责「一屏长图 → 多页 PDF」，
+    # 一个负责「多屏无关截图 → 一份 Word/PDF」。用 Notebook 而不是自绘
+    # 按钮条，是因为 ttk.Notebook 天然带键盘切换（Ctrl+Tab）和焦点管理，
+    # 自绘的「导航」在无障碍和键盘操作上立刻露馅。
+    nav = ttk.Notebook(root)
+    nav.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+    tab_long = ttk.Frame(nav, padding=(10, 8))
+    nav.add(tab_long, text="  滚动截长图  ")
+    tab_shots = ttk.Frame(nav, padding=(10, 8))
+    nav.add(tab_shots, text="  连续截图整合  ")  # 与上一个同级并列
 
     state: dict = {
         "region": None,
@@ -343,8 +356,9 @@ def main() -> int:
         "hidden": False,      # 面板当前是否被最小化（采集期间）
     }
 
-    outer = ttk.Frame(root, padding=12)
+    outer = ttk.Frame(tab_long)
     outer.pack(fill="both", expand=True)
+    shots_panel = None  # 由 main() 末尾填充；on_close 里要在关闭前停掉它的轮询
 
     ttk.Label(outer, text="滚动截长图 → 多页 PDF", style="Title.TLabel").pack(anchor="w")
     ttk.Label(
@@ -830,7 +844,36 @@ def main() -> int:
             state["stop"].set()
             status_var.set("正在停止并导出半成品…")
             return
+        if shots_panel is not None:
+            try:
+                shots_panel["shutdown"]()  # 停掉 F9 轮询，别让它继续 root.after
+            except Exception:  # noqa: BLE001
+                pass
         root.destroy()
+
+    # ---------------- 第二个功能面板 ----------------
+    def shots_tab_active() -> bool:
+        """F9 只在「连续截图整合」标签页激活时响应。
+
+        否则在滚动截长图跑着的时候按一下 F9，两个采集会同时抢屏幕，
+        结果两边都是脏的。
+        """
+        try:
+            return nav.index(nav.select()) == nav.index(str(tab_shots))
+        except tk.TclError:
+            return False
+
+    import shots_gui  # 与 gui.py 同级；延迟导入，只有真要开界面时才需要它
+
+    shots_panel = shots_gui.build_panel(
+        tab_shots,
+        tk=tk,
+        ttk=ttk,
+        filedialog=filedialog,
+        messagebox=messagebox,
+        root=root,
+        can_capture=lambda: shots_tab_active() and not state["running"],
+    )
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh_region_text()

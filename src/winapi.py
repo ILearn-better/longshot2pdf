@@ -36,6 +36,7 @@ WHEEL_DELTA = 120
 MOUSEEVENTF_WHEEL = 0x0800
 INPUT_MOUSE = 0
 VK_ESCAPE = 0x1B
+VK_F9 = 0x78  # 「连续截图整合」的抓屏快捷键（F9 在浏览器/Office 里都没有默认动作）
 
 # GetSystemMetrics 索引
 SM_CXSCREEN = 0
@@ -298,11 +299,22 @@ def wheel(steps: int) -> None:
         raise OSError(f"滚轮投递失败 (SendInput={sent}, err={ctypes.get_last_error()})")
 
 
-def esc_pressed() -> bool:
-    """轮询 ESC 是否被按下（用于中途中断采集）。拿不到键盘状态时返回 False。"""
+def key_down(vk: int) -> bool:
+    """轮询某个虚拟键当前是否被按住（全局，与窗口焦点无关）。
+
+    为什么用轮询而不是 RegisterHotKey：「连续截图整合」面板在抓屏前会把自己
+    最小化，那时 tkinter 的 bind 收不到任何键盘事件；而 GetAsyncKeyState 是
+    查全局键状态，焦点在浏览器上时照样能问到。项目里的 ESC 中断本来就是这个
+    机制（见 esc_pressed），复用同一套比再引入一个消息循环更稳。
+    """
     if user32 is None:
         return False
     try:
-        return bool(user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
-    except Exception:
+        return bool(user32.GetAsyncKeyState(int(vk)) & 0x8000)
+    except Exception:  # noqa: BLE001
         return False
+
+
+def esc_pressed() -> bool:
+    """轮询 ESC 是否被按下（用于中途中断采集）。拿不到键盘状态时返回 False。"""
+    return key_down(VK_ESCAPE)
