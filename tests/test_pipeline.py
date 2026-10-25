@@ -272,6 +272,54 @@ def case_dirty_region_warning() -> None:
     print(f"  [OK] 残差偏高：仍采全 {res.rows} 行，并给出 1 次质量警告（不重复刷屏）")
 
 
+class _JitteryGrabber:
+    """每次抓屏都不一样：模拟视频缩略图 / 加载动画这类天然在动的区域。
+
+    VirtualScreen 的噪声是按 (whell_calls, top) 定种的，同一位置的连续抓屏
+    完全一致，测不出「逐帧独立抖动」。这里用一个真随机的假 grabber 补上。
+    """
+
+    def __init__(self, w=320, h=200, seed=0):
+        self.w, self.h = w, h
+        self.rng = np.random.default_rng(seed)
+
+    def grab(self, region):
+        left, top, w, h = (int(v) for v in region)
+        return self.rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+
+    def close(self):
+        pass
+
+
+def case_jitter_adaptive_threshold() -> None:
+    """画面自身在抖时，质量告警门槛必须跟着抬升，否则会一直误报。
+
+    这是 DIRTY_JITTER_GAIN 的接线验证：`_grab_stable` 必须从既有的连续帧
+    比较里把抖动带出来，而不是额外再抓一帧。
+    """
+    from src.pipeline import DIRTY_ERR, DIRTY_JITTER_GAIN, _grab_stable
+
+    fake = _JitteryGrabber()
+    deps = Deps(grabber=fake, sleep=lambda s: None)
+    _frame, jitter = _grab_stable(deps, (0, 0, 320, 200), 0)
+
+    assert jitter > 0.6, f"抖动画面却报告 jitter={jitter}，说明逐帧比较没有生效"
+    level = max(DIRTY_ERR, DIRTY_JITTER_GAIN * jitter)
+    assert level > DIRTY_ERR, "抖动很大却没有抬升门槛，仍会误报固定元素污染"
+
+    # 静止画面必须收敛到 0，不能把正常情况也当成"在抖"
+    doc = M.make_document(width=320, height=2000)
+    still = M.VirtualScreen(doc, 200, unit_px=80)
+    _f2, jitter2 = _grab_stable(
+        Deps(grabber=still, sleep=lambda s: None), (0, 0, 320, 200), 0
+    )
+    assert jitter2 == 0.0, f"静止画面却报告 jitter={jitter2}"
+    print(
+        f"  [OK] 抖动自适应：动态画面 jitter={jitter:.1f} → 门槛 {DIRTY_ERR}→{level:.1f}；"
+        "静止画面 jitter=0"
+    )
+
+
 def main() -> int:
     shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)
@@ -287,6 +335,8 @@ def main() -> int:
     case_recovers_from_overscroll()
     case_fixed_footer_guard()
     case_lazy_loading()
+    case_dirty_region_warning()
+    case_jitter_adaptive_threshold()
     print("全部通过")
     return 0
 

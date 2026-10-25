@@ -153,11 +153,34 @@ def _mad(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # 残差「偏高但未失败」的判定线。
-# 正常情况下匹配残差 < 1；有固定表头/悬浮按钮压在重叠区上时会抬到 5~10，
-# 但位置依然是对的（只是重叠区被污染了一部分）。这种情况不该中止采集，
-# 而应该**边采边警告**：让用户知道成品可能有重影，下次记得用 strip 剔除。
-# 上界交给 stitch 的 max_error(12)，超过它就直接判失败，不会走到这里。
+#
+# 三份独立实测交叉验证过这个取值：
+#
+# 【真实链路】两帧各自独立过一遍 JPEG（等价于远程桌面逐帧重编码）
+#    q=95 → 0.27   q=85（典型 RDP）→ 0.75   q=75 → 1.05
+#    q=60 → 1.44   q=45（肉眼可见块效应）→ 1.90   ← 最坏情况仍有 1.6 倍余量
+#    4:2:0 色度下采样对残差无影响（绝对值在 RGB 三通道平均后被亮度稀释）
+#
+# 【合成故障】均匀逐像素噪声 ±1/±2/±3/±5/±8 → 0.89 / 1.60 / 2.28 / 3.30 / 4.64
+#    要把残差顶过 3.0，需要每个像素每个通道都加 ±4.5 以上 —— 那个量级比画面里
+#    大部分真实细节的对比度还高，文字已经烂到任何截图工具都无法工作。
+#    所以这条线只对"人为注入均匀噪声"敏感，真实链路踩不到。
+#
+# 【固定条检出】err ≈ (50~100) × 固定带占重叠区的比例，系数取决于固定带与
+#    被覆盖内容的对比度差。所以检出下限是个区间：固定带近白时 ~3% 就能发现，
+#    与正文对比度接近时要 ~6%。
+#
+# 为什么不取 5.0（更保守）：检出下限会被抬到 ~5%~9%，损失一半灵敏度，
+# 而换来的只是防住一个真实链路不存在的场景。
+# 上界仍交给 stitch 的 max_error(12)：超过它直接判失败，走不到这里。
 DIRTY_ERR = 3.0
+
+# 画面**天生就在抖**时的自适应抬升系数。
+# 上面的标定假设抖动来自"链路重编码"，幅度有限；但画面里可能有真正在动的
+# 元素（视频缩略图、加载动画、光标闪烁），它们的抖动是逐帧独立的，
+# 会稳定把残差顶高。这种界面必须把判定线一起抬高，否则告警变成噪音。
+# 抖动值由 _grab_stable 从既有的连续帧比较里带出来，不额外抓帧、不加开销。
+DIRTY_JITTER_GAIN = 2.5
 
 
 def _stable_box(region: Region) -> Region:
@@ -177,23 +200,34 @@ def _grab_stable(
     settle_ms: int,
     tol: float = 0.6,
     max_tries: int = 6,
-) -> np.ndarray:
-    """等画面稳定后再取全帧。
+) -> tuple[np.ndarray, float]:
+    """等画面稳定后再取全帧，返回 (帧, 抖动估计)。
 
     判断依据是「画面不再变化」而不是「等够了时间」——
     因为不同程序的滚动有惯性、有延迟渲染、有图片异步加载，
     固定 sleep 一定会截到中间态。
+
+    为什么顺带返回抖动：这个循环本来就在反复比较连续两帧。
+    如果它始终收敛不到 `tol` 以内，说明这块画面**天生就在抖**
+    （远程桌面重绘、视频缩略图、低质量 JPEG），调用方需要据此抬高
+    质量告警的门槛，否则会把正常抖动误报成「有固定元素污染」。
+    抖动值从既有比较里取，不额外抓帧、不增加开销。
     """
     deps.sleep(settle_ms / 1000.0)
     box = _stable_box(region)
     ref = deps.grabber.grab(box)
+    jitter = 0.0
+    converged = False
     for _ in range(max_tries):
         deps.sleep(0.045)
         cur = deps.grabber.grab(box)
-        if _mad(cur, ref) < tol:
+        jitter = _mad(cur, ref)
+        if jitter < tol:
+            converged = True
             break
         ref = cur
-    return deps.grabber.grab(region)
+    # 收敛了就说明画面静止，抖动按 0 计（此时的 jitter 是"已经小到可忽略"的值）
+    return deps.grabber.grab(region), (0.0 if converged else jitter)
 
 
 # ---------------------------------------------------------------- 主流程
@@ -284,7 +318,7 @@ def run(
 
         # ---------- 2. 首帧 ----------
         report(0, 0, 0, "探测通过，正在采集首帧…")
-        prev = _grab_stable(d, region, cfg.settle_ms)
+        prev, _jit = _grab_stable(d, region, cfg.settle_ms)
         stitcher.append(prev)
         total_frames = 1
 
@@ -302,7 +336,7 @@ def run(
             report(total_frames, stitcher.page_count, stitcher.total_rows, last_note)
         else:
             d.wheel(-1)
-            nxt = _grab_stable(d, region, cfg.settle_ms)
+            nxt, _jit = _grab_stable(d, region, cfg.settle_ms)
             loc = locate(prev, nxt)
             if loc is not None:
                 new_start, delta, _err = loc
@@ -357,7 +391,7 @@ def run(
                 break
 
             d.wheel(-steps)
-            cur = _grab_stable(d, region, cfg.settle_ms)
+            cur, jitter = _grab_stable(d, region, cfg.settle_ms)
             loc = locate(prev, cur)
 
             if loc is None:
@@ -394,7 +428,10 @@ def run(
 
             # 残差偏高 = 位置对但重叠区被污染（固定表头压在重叠带上等）。
             # 不中止，只提醒：中止会让用户拿不到东西，而重影是"能修"的。
-            if _err > DIRTY_ERR:
+            # 判定线随画面自身抖动抬升：视频缩略图/加载动画这类天然在动的区域，
+            # 残差本来就高，固定门槛会一直误报。
+            err_level = max(DIRTY_ERR, DIRTY_JITTER_GAIN * jitter)
+            if _err > err_level:
                 dirty_run += 1
                 if (
                     dirty_run >= 3
