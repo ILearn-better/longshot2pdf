@@ -21,6 +21,7 @@ output/
 out/
 longshot_*/
 tests/_tmp_pages/
+tests/_tmp_pipeline/
 tests/_tmp_out.pdf
 *.tmp
 *.temp

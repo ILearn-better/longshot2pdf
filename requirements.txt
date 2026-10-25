@@ -1,0 +1,12 @@
+# LongShot2PDF 运行依赖
+# 只固定「最低可用版本」而不是钉死小版本：这些都是纯 Python / 预编译轮子，
+# 钉太死反而会和用户的 Python 版本打架。安装：pip install -r requirements.txt
+
+mss>=10.0        # 区域截图（BitBlt 后端，单帧 1000x1400 约 5~15ms）
+numpy>=1.26      # 帧缓冲、灰度匹配、整数像素裁切
+pillow>=10.0     # JPEG 编码（subsampling=0 保证文字边缘不发虚）
+img2pdf>=0.5     # JPEG 码流直塞 PDF，零重编码（像素零损失的关键）
+pypdf>=4.0       # 仅自测/校验时读回页数（运行时缺了也不影响出 PDF）
+
+# tkinter 属于 Python 标准库（Windows 官方安装包自带），不在此列。
+# 若 `python -c "import tkinter"` 失败，只能用命令行模式：python cli.py --help
