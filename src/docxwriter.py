@@ -186,9 +186,10 @@ def write_docx(
     *,
     align: str = "center",
     page_break_between: bool = True,
-    quality: int = 85,
+    quality: int = 90,
     gap_pt: float = 6.0,
     title: str = "连续截图整合",
+    sizes_px: Sequence[tuple[int, int]] | None = None,
 ) -> Path:
     """把一组 RGB 图片写成 docx，返回输出路径。
 
@@ -196,6 +197,9 @@ def write_docx(
     page_break_between : True = 每张图一页；False = 首尾相接连续排布。
     gap_pt : 连续排布时图与图之间的空隙（pt），每图一页时是页内底部留白。
     quality : JPEG 质量，与 PDF 侧保持一致。
+    sizes_px : 每张图的**排版尺寸**（96dpi 口径）。给了它就按这个尺寸算 EMU，
+        图片本身的像素可以更大 —— 页面上占的宽度不变，但每英寸的像素更多，
+        也就是「同样的版面、更高的清晰度」。不传时退回按图片自身像素算。
 
     尺寸策略：所有图**乘同一个缩放系数**，让最宽的那张正好放进版心。
     不用「每张各自缩到版心宽」——那样宽度 800 和 1600 的图会变成一样大，
@@ -204,19 +208,31 @@ def write_docx(
     if len(images) == 0:
         raise ValueError("没有可导出的图片")
 
-    pxs = [(int(im.shape[1]), int(im.shape[0])) for im in images]
-    if any(w <= 0 or h <= 0 for w, h in pxs):
+    actual = [(int(im.shape[1]), int(im.shape[0])) for im in images]
+    if any(w <= 0 or h <= 0 for w, h in actual):
         raise ValueError("存在空图片")
+
+    if sizes_px is None:
+        logical = actual
+    else:
+        logical = [(int(w), int(h)) for w, h in sizes_px]
+        if len(logical) != len(actual):
+            raise ValueError(
+                f"sizes_px 数量（{len(logical)}）与图片数量（{len(actual)}）不一致"
+            )
+        if any(w <= 0 or h <= 0 for w, h in logical):
+            raise ValueError("sizes_px 里有非正的尺寸")
 
     usable_twip = A4_W_TWIP - 2 * MARGIN_TWIP
     usable_emu = int(usable_twip * 635)          # 1 twip = 635 EMU
-    widest_emu = max(w for w, _ in pxs) * EMU_PER_PX
+    # 缩放系数按**排版尺寸**算，与嵌入像素无关 —— 这正是「版式不变、像素变多」的关键
+    widest_emu = max(w for w, _ in logical) * EMU_PER_PX
     scale = min(1.0, usable_emu / max(1, widest_emu))
 
     gap_twip = max(0, int(round(gap_pt * 20)))
 
     body: list[str] = []
-    for i, (w, h) in enumerate(pxs, start=1):
+    for i, (w, h) in enumerate(logical, start=1):
         if i > 1 and page_break_between:
             body.append(_PAGE_BREAK)
         cx = max(1, int(round(w * EMU_PER_PX * scale)))

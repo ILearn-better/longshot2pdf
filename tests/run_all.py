@@ -20,11 +20,12 @@ ROOT = Path(__file__).resolve().parent.parent
 SUITES = [
     "test_stitch.py",       # 拼接内核（合成帧，零接缝）
     "test_probe.py",        # 滚轮探测
-    "test_shots.py",        # 连续截图整合：尺寸/位置对齐、页数估算、扫描滤镜
+    "test_region.py",       # 截取区域：框选、收口、九宫格对齐、按比例改尺寸
+    "test_shots.py",        # 连续截图整合：尺寸/位置对齐、页数估算、清晰度、扫描滤镜
     "test_export.py",       # 连续截图整合：docx / PDF 真的写得出来
     "test_pipeline.py",     # 编排（自动 / 手动滚动）
     "test_gui_hide.py",     # 界面：最小化时间线
-    "test_shots_panel.py",  # 界面：连续截图面板（顺序、联动、导出）
+    "test_shots_panel.py",  # 界面：连续截图面板（整屏/框选、顺序、联动、导出）
 ]
 
 # 界面那两条需要 tkinter：嵌入版 / 精简版 Python 没有它，

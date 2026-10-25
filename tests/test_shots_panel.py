@@ -15,6 +15,13 @@
 5. 一键导出 Word → 文件真的生成，状态区显示结果，「打开文件」可用
 6. 清空 → 回到初始状态
 7. shutdown() 能停掉 F9 轮询（不会留下 root.after 定时器）
+8. 取消保存对话框 → 不导出、不进忙碌态
+9. 切到「自定义区域」→ 区域控件出现、默认给一个居中框
+10. 九宫格对齐只挪位置；锁定比例改宽时高跟着变
+11. 抓取框选区域 → 传下去的 rect 与界面上的数字一致，列表标出「框选」
+12. 统一输出宽度 → 抓到的图按这个宽度等比缩放
+13. 「框选区域…」→ 覆盖层返回的矩形直接成为新区域
+14. 切回「整屏」→ 区域控件整块消失，抓的还是整屏
 
 直接运行：  python tests/test_shots_panel.py
 """
@@ -36,6 +43,7 @@ import tkinter as tk  # noqa: E402
 from tkinter import ttk  # noqa: E402
 
 import shots_gui  # noqa: E402
+from src import regionpick  # noqa: E402
 from src.docxwriter import docx_image_count  # noqa: E402
 
 
@@ -267,6 +275,134 @@ def case_cancel_export(tmp: Path) -> None:
             pass
 
 
+def case_region(tmp: Path) -> None:
+    """自定义区域：框选、对齐、按比例改尺寸、统一输出宽度。"""
+    print("\n[9] 自定义区域模式")
+    original = (shots_gui.screen_rect, shots_gui.grab_screen,
+                shots_gui.grab_region, regionpick.select_region)
+    shots_gui.screen_rect = lambda: (0, 0, 1920, 1080)
+    shots_gui.grab_screen = fake_grab((1920, 1080))
+    got_rects: list[tuple] = []
+
+    def fake_region_grab(rect):
+        got_rects.append(tuple(int(v) for v in rect))
+        w, h = int(rect[2]), int(rect[3])
+        img = np.full((h, w, 3), 210, dtype=np.uint8)
+        img[: max(1, h // 10)] = 60
+        return img
+
+    shots_gui.grab_region = fake_region_grab
+    root = make_root()
+    dialog = FakeDialog(save_to=tmp / "region.docx")
+    try:
+        panel = build(root, dialog)
+        panel["vars"]["hide"].set(False)
+        mode = panel["vars"]["capture_mode"]
+        lb = panel["widgets"]["listbox"]
+
+        print("\n[9a] 切到自定义区域 → 默认给一个居中框")
+        assert panel["widgets"]["screen"].get() == "屏幕 1920×1080", (
+            panel["widgets"]["screen"].get()
+        )
+        mode.set("region")
+        assert pump(root, lambda: panel["vars"]["region_w"].get() == "1344"), (
+            panel["vars"]["region_w"].get()
+        )
+        assert panel["vars"]["region_x"].get() == "288", panel["vars"]["region_x"].get()
+        assert panel["vars"]["region_y"].get() == "162"
+        assert "框选区域" in panel["widgets"]["capture"].cget("text"), (
+            panel["widgets"]["capture"].cget("text")
+        )
+        print(f"      默认 {panel['vars']['region_w'].get()}×"
+              f"{panel['vars']['region_h'].get()} @ "
+              f"({panel['vars']['region_x'].get()}, {panel['vars']['region_y'].get()})")
+
+        print("\n[9b] 九宫格对齐：只挪位置")
+        panel["callbacks"]["snap"]("left", "top")
+        assert (panel["vars"]["region_x"].get(), panel["vars"]["region_y"].get()) == ("0", "0")
+        panel["callbacks"]["snap"]("right", "bottom")
+        rx, ry = int(panel["vars"]["region_x"].get()), int(panel["vars"]["region_y"].get())
+        assert (rx, ry) == (1920 - 1344, 1080 - 756), (rx, ry)
+        assert panel["vars"]["region_w"].get() == "1344", "对齐不该改尺寸"
+        print(f"      贴右下 → ({rx}, {ry})，尺寸仍是 1344×756")
+
+        print("\n[9c] 改尺寸：锁定比例联动")
+        panel["callbacks"]["snap"]("left", "top")
+        panel["vars"]["region_w"].set("1600")
+        panel["callbacks"]["normalize_region"]()
+        assert panel["vars"]["region_w"].get() == "1600"
+        assert panel["vars"]["region_h"].get() == "756", panel["vars"]["region_h"].get()
+        panel["vars"]["lock_ratio"].set(True)
+        panel["vars"]["region_w"].set("800")
+        panel["callbacks"]["normalize_region"]()
+        assert panel["vars"]["region_w"].get() == "800", panel["vars"]["region_w"].get()
+        # 基准是「当前这块」的 1600:756，宽减半 → 高也减半
+        assert panel["vars"]["region_h"].get() == "378", panel["vars"]["region_h"].get()
+        panel["vars"]["region_h"].set("189")
+        panel["callbacks"]["normalize_region"]()
+        assert panel["vars"]["region_w"].get() == "400", panel["vars"]["region_w"].get()
+        print("      未锁比例 1600×756；锁比例后改宽 800 → 高 378，改高 189 → 宽 400")
+
+        print("\n[9d] 抓取框选区域")
+        # 先把区域定成一块好认的尺寸，再验「界面上的数字 == 传给抓屏的 rect」
+        panel["vars"]["lock_ratio"].set(False)
+        panel["vars"]["region_x"].set("120")
+        panel["vars"]["region_y"].set("80")
+        panel["vars"]["region_w"].set("800")
+        panel["vars"]["region_h"].set("450")
+        panel["callbacks"]["normalize_region"]()
+        expect = tuple(
+            int(panel["vars"][k].get()) for k in ("region_x", "region_y", "region_w", "region_h")
+        )
+        grab_once(panel, root, 1)
+        assert got_rects and got_rects[-1] == expect, (got_rects, expect)
+        assert "800×450" in lb.get(0), lb.get(0)
+        assert "框选" in lb.get(0), lb.get(0)
+        assert "框选" in panel["widgets"]["status"].get()
+        print(f"      {lb.get(0)!r} → 传给抓屏的 rect {got_rects[-1]}")
+
+        print("\n[9e] 统一输出宽度")
+        panel["vars"]["out_mode"].set("fixed")
+        panel["vars"]["out_width"].set("1200")
+        # 800×450 统一到宽 1200 → 高 675
+        assert pump(root, lambda: "1200 × 675" in panel["widgets"]["out_hint"].get()), (
+            panel["widgets"]["out_hint"].get()
+        )
+        grab_once(panel, root, 2)
+        assert "1200×675" in lb.get(1), lb.get(1)
+        assert got_rects[-1] == expect, "统一输出宽度不该改变截取区域"
+        print(f"      {lb.get(1)!r} · {panel['widgets']['out_hint'].get()}")
+
+        print("\n[9f] 「框选区域…」→ 覆盖层返回值即新区域")
+        regionpick.select_region = lambda initial=None, hint="": (100, 120, 640, 480)
+        panel["pick"]()
+        assert pump(root, lambda: panel["vars"]["region_w"].get() == "640"), (
+            panel["vars"]["region_w"].get()
+        )
+        assert panel["vars"]["region_x"].get() == "100"
+        assert "已框选 640×480" in panel["widgets"]["status"].get(), (
+            panel["widgets"]["status"].get()
+        )
+        print(f"      {panel['widgets']['status'].get()}")
+
+        print("\n[9g] 切回整屏 → 区域控件消失，抓的仍是整屏")
+        mode.set("screen")
+        assert pump(root, lambda: "整屏" in panel["widgets"]["status"].get())
+        assert "截取当前屏" in panel["widgets"]["capture"].cget("text")
+        before = len(got_rects)
+        grab_once(panel, root, 3)
+        assert len(got_rects) == before, "整屏模式不该调用 grab_region"
+        assert "1920×1080" in lb.get(2), lb.get(2)
+        print(f"      {lb.get(2)!r} · {panel['widgets']['status'].get()}")
+    finally:
+        (shots_gui.screen_rect, shots_gui.grab_screen,
+         shots_gui.grab_region, regionpick.select_region) = original
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
 def main() -> int:
     print("=" * 64)
     print("连续截图整合 · 面板集成")
@@ -275,6 +411,7 @@ def main() -> int:
     try:
         case_flow(tmp)
         case_cancel_export(tmp)
+        case_region(tmp)
     except AssertionError as exc:
         print(f"\n[FAIL] {exc}")
         return 1

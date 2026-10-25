@@ -111,11 +111,33 @@ if user32 is not None:
 
 
 def enable_dpi_awareness() -> None:
-    """声明进程为 DPI 感知。
+    """声明进程为 DPI 感知（尽量拿到最高的那一档）。
 
     不声明的话，在 125%/150% 缩放的系统上，mss 取到的是缩放后的位图，
     而 tkinter 框选拿到的是逻辑坐标，两者不在同一坐标系，框出来的区域会漂移。
+
+    三档依次尝试，越靠前越好：
+
+    ==============================================  ==================
+    ``SetProcessDpiAwarenessContext(-4)``           Per-Monitor V2（Win10 1703+）
+    ``SetProcessDpiAwareness(2)``                   Per-Monitor V1（Win8.1+）
+    ``SetProcessDPIAware()``                        System DPI Aware（Vista+）
+    ==============================================  ==================
+
+    为什么非要争 V2：只有 V2 才能保证「每个显示器都按它自己的物理像素出图」。
+    停在 V1 时，跨不同缩放的副屏上抓到的图会被系统位图拉伸一次，
+    表现就是**像素偏低、文字发虚** —— 这不是缩放算法的问题，源头就没拿到足够的像素。
     """
+    ctx = -4  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    try:
+        if user32 is not None:
+            fn = user32.SetProcessDpiAwarenessContext
+            fn.argtypes = [ctypes.c_void_p]
+            fn.restype = wintypes.BOOL
+            if fn(ctypes.c_void_p(ctx)):
+                return
+    except Exception:
+        pass  # 老系统没这个符号，或用清单已固定过，都往下退
     try:
         ctypes.WinDLL("shcore").SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
         return

@@ -35,6 +35,12 @@ MIN_TARGET_PX = 200
 MAX_TARGET_PX = 8000
 MAX_SIDE_PX = 20000  # 拼版后单页任一边的上限，超了任何阅读器都会很卡
 MAX_STRIP_H = 200_000  # 连续排列时整条竖图的高度上限（约 100 页 A4）
+MAX_STRIP_BYTES = 900 * 1024 * 1024  # 拼一整条时的内存上限，超了先劝退
+
+# 输出清晰度：嵌入像素 = 排版尺寸 × hi_res，但**不超过原始像素**。
+# 上限 4 是按「4K 截图 + 缩小排版」留的余量；再往上只是把 JPEG 体积推高。
+MIN_HI_RES = 1.0
+MAX_HI_RES = 4.0
 
 SIZE_MODES = ("width", "height", "original")
 ALIGN_MODES = ("left", "center", "right")
@@ -80,6 +86,11 @@ class Layout:
     scan: bool = False            # 是否套扫描版效果
     scan_strength: int = 50       # 0~100
 
+    # 输出清晰度：嵌入像素 = 排版尺寸 × hi_res，且不超过原始像素。
+    # 默认 2.0，意思是「只要原图有那么多像素，就按两倍排版尺寸嵌入」——
+    # 再高只是把文件推大，再低就会把 1080p 截图糟蹋成 1200px。
+    hi_res: float = 2.0
+
     def normalized(self) -> "Layout":
         """把越界参数收进合法区间，避免界面上的手输值直接炸到渲染层。"""
         mode = self.size_mode if self.size_mode in SIZE_MODES else "width"
@@ -95,17 +106,29 @@ class Layout:
             page_ratio=float(np.clip(self.page_ratio, 0.3, 5.0)),
             scan=bool(self.scan),
             scan_strength=int(np.clip(self.scan_strength, 0, 100)),
+            hi_res=float(np.clip(self.hi_res, MIN_HI_RES, MAX_HI_RES)),
         )
 
 
 @dataclass
 class Placed:
-    """排版后的一张图：像素尺寸 + 在内容区里的水平偏移。"""
+    """排版后的一张图：实际像素 + 在画布里的水平偏移 + 排版口径的尺寸。
+
+    三个尺寸要分清，混用一定会出错：
+      · ``width`` / ``height``  实际嵌入的像素（已乘清晰度倍数）
+      · ``logical_*``           96dpi 口径的排版尺寸（决定它在纸上多大）
+      · ``scale``               width / logical_width
+    PDF 只看前两个的**比例**，Word 用 logical_* 算 EMU —— 两个格式都只认
+    「排版尺寸」，像素多了只是更清晰，不会把图撑大。
+    """
 
     image: np.ndarray
     width: int
     height: int
     x: int = 0
+    logical_width: int = 0
+    logical_height: int = 0
+    scale: float = 1.0
 
 
 # ---------------------------------------------------------------- 尺寸对齐
@@ -139,19 +162,64 @@ def target_size(width: int, height: int, layout: Layout) -> tuple[int, int]:
     return int(new_w), int(new_h)
 
 
-def resize_to(img: np.ndarray, layout: Layout) -> np.ndarray:
-    """按 size_mode 把单张图缩放到统一尺寸，返回数组（尺寸没变时原样返回）。
+def resize_exact(img: np.ndarray, width: int, height: int) -> np.ndarray:
+    """精确缩放到给定像素，返回数组（尺寸相同则原样返回，不复制）。
 
-    用 LANCZOS 而不是 NEAREST/BILINEAR：截图里大量是文字，
-    低质量的缩放在小字号上会出现笔画断裂，而 LANCZOS 是 Pillow 里
-    对缩小最友好的一种（带抗锯齿的低通，不会产生摩尔纹）。
+    一律用 LANCZOS：截图里大量是文字，BILINEAR/NEAREST 会把小字号的笔画弄断，
+    而 LANCZOS 是 Pillow 里对缩小最友好的一种（带抗锯齿的低通，没有摩尔纹）。
     """
     h, w = int(img.shape[0]), int(img.shape[1])
+    width, height = max(1, int(width)), max(1, int(height))
+    if (width, height) == (w, h):
+        return img
+    return np.asarray(Image.fromarray(img).resize((width, height), Image.LANCZOS))
+
+
+def resize_to(img: np.ndarray, layout: Layout) -> np.ndarray:
+    """按 size_mode 把单张图缩放到**排版尺寸**（96dpi 口径），返回数组。"""
+    h, w = int(img.shape[0]), int(img.shape[1])
     new_w, new_h = target_size(w, h, layout)
-    if (new_w, new_h) == (w, h):
-        return img  # 不复制：original 模式 / 尺寸刚好一致时零开销
-    im = Image.fromarray(img).resize((new_w, new_h), Image.LANCZOS)
-    return np.asarray(im)
+    return resize_exact(img, new_w, new_h)
+
+
+def resize_to_width(img: np.ndarray, width: int) -> np.ndarray:
+    """按宽度等比缩放，宽度已一致时原样返回。
+
+    界面上的「输出宽度」用它：框出来的区域大小各异，但交付出去的图可以一边宽。
+    注意放大只是插值，**不会增加细节** —— 想要更清晰只能把框框得更大。
+    """
+    w, h = int(img.shape[1]), int(img.shape[0])
+    width = max(1, int(width))
+    if width == w:
+        return img
+    return resize_exact(img, width, max(1, int(round(h * width / w))))
+
+
+def embed_scale(shot: "Shot", layout: Layout) -> float:
+    """这张图按几倍于排版尺寸嵌入 —— 不超过 hi_res，也**不超过原始像素**。
+
+    「不超过原始像素」是硬规则：光源不够时放大只是插值，看着更糊、文件更大，
+    一个有用像素都不会多出来。所以导出的策略是**只许少缩、绝不虚放**：
+    1080p 截图排版到 1200px 宽时，嵌入用满 1920 原生像素（1.6×）；
+    4K 截图则被 hi_res 挡在 2×，免得文件平白翻倍。
+    """
+    lay = layout.normalized()
+    logical_w, _ = target_size(shot.width, shot.height, lay)
+    if logical_w <= 0:
+        return MIN_HI_RES
+    return float(max(MIN_HI_RES, min(lay.hi_res, shot.width / logical_w)))
+
+
+def estimate_dpi(shots: Sequence["Shot"], layout: Layout) -> float:
+    """这批图里**最差**那张的等效分辨率（96dpi 口径 × 嵌入倍数）。
+
+    取最小值而不是平均值：一份文档里只要有一张虚的，整体观感就下来了，
+    界面上的「清晰度」提示应当反映最坏情况。
+    """
+    lay = layout.normalized()
+    if not shots:
+        return 96.0 * lay.hi_res
+    return 96.0 * min(embed_scale(s, lay) for s in shots)
 
 
 # ---------------------------------------------------------------- 扫描版效果
@@ -221,43 +289,53 @@ def _gaussian_blur(radius: float):
 # ---------------------------------------------------------------- 位置对齐 + 拼版
 
 
-def _geometry(shots: Sequence[Shot], lay: Layout) -> tuple[list[tuple[int, int, int]], int]:
-    """算出每张图的 (宽, 高, 水平偏移) 和内容区宽度。
+def _logical(shots: Sequence[Shot], lay: Layout) -> list[tuple[int, int]]:
+    """每张图的排版尺寸（96dpi 口径）。页数估算与真实渲染共用它。"""
+    return [target_size(s.width, s.height, lay) for s in shots]
 
-    prepare()（真像素）与 estimate_pages()（纯算术）共用这一个函数：
-    「页数估算」和「实际渲染」是同一套几何，不可能算出不同的页数。
+
+def _compose(shots: Sequence[Shot], lay: Layout, scales: Sequence[float]) -> list[Placed]:
+    """按给定的嵌入倍数把每张图缩好、套滤镜、算出水平偏移。
+
+    偏移用缩放**前**的排版尺寸算（content_w - logical_w），再乘这一张自己的
+    倍数 —— 各图的密度可以不同，但对齐关系必须一致，否则「居中」会歪。
     """
-    sizes = [target_size(s.width, s.height, lay) for s in shots]
-    if not sizes:
-        return [], 0
-
-    content_w = max(w for w, _ in sizes)
-    geo: list[tuple[int, int, int]] = []
-    for w, h in sizes:
+    logical = _logical(shots, lay)
+    if not logical:
+        return []
+    content_w = max(w for w, _ in logical)
+    placed: list[Placed] = []
+    for shot, (lw, lh), s in zip(shots, logical, scales):
+        img = resize_exact(shot.image, int(round(lw * s)), int(round(lh * s)))
+        if lay.scan:
+            img = apply_scan(img, lay.scan_strength)
+        # 宽度以 resize 后的实际值为准：PIL 内部按浮点取整，
+        # 理论上可能与算术值差 1px，以实际像素为准才不会贴歪。
+        w, h = int(img.shape[1]), int(img.shape[0])
         if lay.align == "left":
             x = 0
         elif lay.align == "right":
-            x = content_w - w
+            x = int(round((content_w - lw) * s))
         else:
-            x = (content_w - w) // 2
-        geo.append((w, h, max(0, x)))
-    return geo, content_w
+            x = int(round((content_w - lw) * s / 2))
+        placed.append(
+            Placed(
+                image=img, width=w, height=h, x=max(0, x),
+                logical_width=lw, logical_height=lh, scale=float(s),
+            )
+        )
+    return placed
 
 
 def prepare(shots: Sequence[Shot], layout: Layout) -> list[Placed]:
-    """把所有图缩放到统一尺寸，并按 align 算出水平偏移（真实像素）。"""
+    """把所有图缩放到统一尺寸，并按 align 算出水平偏移（真实像素）。
+
+    每张图用自己能达到的最大嵌入倍数（见 embed_scale），所以同一份文档里
+    可能一张 1.6× 一张 2× —— 这在「纸上」完全看不出来（排版尺寸相同），
+    只是清晰的那张多带了点像素。
+    """
     lay = layout.normalized()
-    geo, _ = _geometry(shots, lay)
-    placed: list[Placed] = []
-    for shot, (_, _, x) in zip(shots, geo):
-        img = resize_to(shot.image, lay)
-        if lay.scan:
-            img = apply_scan(img, lay.scan_strength)
-        # 宽度以 resize 后的实际值为准：PIL 内部会按浮点取整，
-        # 理论上可能与 target_size 的算术值差 1px，以实际像素为准才不会贴歪。
-        w, h = int(img.shape[1]), int(img.shape[0])
-        placed.append(Placed(image=img, width=w, height=h, x=x))
-    return placed
+    return _compose(shots, lay, [embed_scale(s, lay) for s in shots])
 
 
 def render_pages(shots: Sequence[Shot], layout: Layout) -> list[np.ndarray]:
@@ -265,48 +343,65 @@ def render_pages(shots: Sequence[Shot], layout: Layout) -> list[np.ndarray]:
 
     each : 一张图一页。页宽 = 内容宽 + 两侧边距，页高 = 图高 + 上下边距。
            页高跟着图片走，所以任何长宽比的图都不会被拉伸、也不会被裁。
+           各页的像素密度可以不同 —— 它们的**物理**尺寸由写文件层按比例决定，
+           所以 PDF 里翻页不会忽大忽小。
     flow : 所有图竖排成一整条，再按 page_ratio 切成若干页。
            切页允许从一张图中间断开 —— 这正是「连续排列」在纸上的样子，
            比为了不切断而把图缩小（从而破坏尺寸统一）更合理。
+           整条只能用**一个**密度，否则并排的两张图大小不一致。
     """
     lay = layout.normalized()
     placed = prepare(shots, lay)
     if not placed:
         return []
 
-    content_w = max(p.width + p.x for p in placed)
-    page_w = content_w + 2 * lay.margin_px
+    margin = lay.margin_px
+
+    if lay.paging == "each":
+        content_w = max(p.logical_width for p in placed)
+        pages = []
+        for p in placed:
+            s = p.scale
+            page_w = int(round((content_w + 2 * margin) * s))
+            page_h = int(round((p.logical_height + 2 * margin) * s))
+            if page_w > MAX_SIDE_PX or page_h > MAX_SIDE_PX:
+                raise ValueError(
+                    f"单页 {page_w}×{page_h}px 超过上限 {MAX_SIDE_PX}px，"
+                    "请降低「统一宽度/高度」或边距"
+                )
+            canvas = np.full((page_h, page_w, 3), 255, dtype=np.uint8)
+            y0 = min(max(0, int(round(margin * s))), max(0, page_h - p.height))
+            x0 = min(max(0, int(round(margin * s)) + p.x), max(0, page_w - p.width))
+            canvas[y0 : y0 + p.height, x0 : x0 + p.width] = p.image
+            pages.append(canvas)
+        return pages
+
+    # ---- flow：整条用一个密度（各图密度不同时降级到最小的那个） ----
+    s = min(p.scale for p in placed)
+    if any(abs(p.scale - s) > 1e-6 for p in placed):
+        placed = _compose(shots, lay, [s] * len(placed))
+
+    content_w = max(p.logical_width for p in placed)
+    page_w = int(round((content_w + 2 * margin) * s))
     if page_w > MAX_SIDE_PX:
         raise ValueError(
             f"页宽 {page_w}px 超过上限 {MAX_SIDE_PX}px，请降低「统一宽度」或边距"
         )
-
-    if lay.paging == "each":
-        pages = []
-        for p in placed:
-            page_h = p.height + 2 * lay.margin_px
-            if page_h > MAX_SIDE_PX:
-                raise ValueError(
-                    f"单页高 {page_h}px 超过上限 {MAX_SIDE_PX}px，请降低「统一高度」"
-                )
-            canvas = np.full((page_h, page_w, 3), 255, dtype=np.uint8)
-            x0 = lay.margin_px + p.x
-            canvas[lay.margin_px : lay.margin_px + p.height, x0 : x0 + p.width] = p.image
-            pages.append(canvas)
-        return pages
-
-    # ---- flow：先拼成一整条，再切页 ----
-    total_h = sum(p.height for p in placed) + lay.gap_px * (len(placed) - 1)
-    if total_h + 2 * lay.margin_px > MAX_STRIP_H:
+    gap = int(round(lay.gap_px * s))
+    margin_px = int(round(margin * s))
+    total_h = sum(p.height for p in placed) + gap * (len(placed) - 1)
+    strip_h = total_h + 2 * margin_px
+    if strip_h > MAX_STRIP_H or strip_h * page_w * 3 > MAX_STRIP_BYTES:
         raise ValueError(
-            f"连续排列总高 {total_h}px 超过上限 {MAX_STRIP_H}px，请改用「每图一页」"
+            f"连续排列总高 {strip_h}px 太大（{strip_h * page_w * 3 // 1048576}MB），"
+            "请改用「每图一页」或降低输出清晰度"
         )
-    strip = np.full((total_h + 2 * lay.margin_px, page_w, 3), 255, dtype=np.uint8)
-    y = lay.margin_px
+    strip = np.full((strip_h, page_w, 3), 255, dtype=np.uint8)
+    y = margin_px
     for p in placed:
-        x0 = lay.margin_px + p.x
+        x0 = min(max(0, margin_px + p.x), max(0, page_w - p.width))
         strip[y : y + p.height, x0 : x0 + p.width] = p.image
-        y += p.height + lay.gap_px
+        y += p.height + gap
     return _split_strip(strip, page_w, lay.page_ratio)
 
 
@@ -327,21 +422,26 @@ def _split_strip(strip: np.ndarray, page_w: int, page_ratio: float) -> list[np.n
 def estimate_pages(shots: Sequence[Shot], layout: Layout) -> int:
     """不渲染就估出页数，供界面上的「预计 N 页」用。
 
-    与 render_pages 的口径必须一致，所以这里复用了同一套尺寸计算
-    （_geometry），而不是另写一个粗略公式 —— 两套口径迟早会对不上。
+    与 render_pages 的口径必须一致，所以这里复用了同一套算术
+    （_logical + embed_scale），而不是另写一个粗略公式 —— 两套口径迟早对不上。
     注意它**不解码像素**：滑杆每动一下都会调用，真缩放会让界面卡顿。
     """
     lay = layout.normalized()
-    geo, content_w = _geometry(shots, lay)
-    if not geo:
+    if not shots:
         return 0
+    logical = _logical(shots, lay)
     if lay.paging == "each":
-        return len(geo)
+        return len(logical)
 
-    total_h = sum(h for _, h, _ in geo) + lay.gap_px * (len(geo) - 1)
-    page_w = content_w + 2 * lay.margin_px
+    content_w = max(w for w, _ in logical)
+    s = min(embed_scale(shot, lay) for shot in shots)
+    page_w = int(round((content_w + 2 * lay.margin_px) * s))
     page_h = max(1, int(round(page_w * lay.page_ratio)))
-    return max(1, -(-(total_h + 2 * lay.margin_px) // page_h))
+    total_h = sum(int(round(h * s)) for _, h in logical) + int(round(lay.gap_px * s)) * (
+        len(logical) - 1
+    )
+    strip_h = total_h + 2 * int(round(lay.margin_px * s))
+    return max(1, -(-strip_h // page_h))
 
 
 def estimate_size(shots: Sequence[Shot], layout: Layout) -> tuple[int, int] | None:

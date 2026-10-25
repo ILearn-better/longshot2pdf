@@ -87,7 +87,7 @@ def export_document(
     out_path,
     fmt: str = "pdf",
     *,
-    quality: int = 85,
+    quality: int = 90,
     title: str = "连续截图整合",
 ) -> ExportResult:
     """把截图按 layout 排版后写成 Word 或 PDF，返回 ExportResult。
@@ -97,6 +97,8 @@ def export_document(
     shots : 按截图顺序排列的 Shot 列表（顺序就是文档顺序，这里不再排序）
     layout : 排版参数；内部会 normalized()，界面的越界输入不会炸到这一层
     fmt : 'docx' / 'pdf'，也接受 'word' / 'Word' / '.pdf'
+    quality : JPEG 质量。默认 90 而不是 85 —— 截图里全是细笔画文字，
+        85 在小字号上能看出色块，而 90 的体积只大 20% 左右。
     """
     shots = list(shots)
     if not shots:
@@ -124,11 +126,15 @@ def export_document(
             quality=int(quality),
             gap_pt=max(0.0, lay.gap_px * _PX_TO_PT),
             title=title,
+            # 关键：EMU 按**排版尺寸**算，图片像素可以更大 —— 版面不变、清晰度更高
+            sizes_px=[(p.logical_width, p.logical_height) for p in placed],
         )
         images = len(placed)
     else:
         from .pdfwriter import images_to_pdf
 
+        # render_pages 出来的画布已经是「排版尺寸 × 清晰度倍数」，而 img2pdf
+        # 只按宽高比例决定页尺寸，所以物理版面一模一样，只是每英寸像素更多。
         canvases = render_pages(shots, lay)
         images_to_pdf(canvases, out_path, quality=int(quality))
         images = len(shots)

@@ -31,16 +31,23 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# 用 typing.Tuple：别名在运行期求值，内置 tuple[...] 需要 Python 3.9+
-Region = Tuple[int, int, int, int]  # (left, top, width, height) 物理像素
-
-MIN_SELECTION = 40  # 松手时宽或高小于此值视为误触，忽略这次拖拽
+# 框选相关的实现搬到了 src/regionpick.py：两个面板都要用它，而
+# `python gui.py` 下本模块的名字是 __main__，从别处 import gui 会把界面再跑一遍。
+# 这里保留同名对象，既有的调用与测试（gui.select_region = ...）都不用改。
+from src.regionpick import (  # noqa: E402
+    MIN_SELECTION,
+    Region,
+    _coerce_region,
+    _geometry,
+    rect_from_points,
+    select_region,
+    virtual_screen_rect,
+)
 
 
 # --------------------------------------------------------------------- 环境准备
@@ -57,215 +64,6 @@ def _load_tk():
             "请改用命令行：python cli.py --region x,y,w,h --out 输出.pdf"
         ) from exc
     return tk, ttk, filedialog, messagebox
-
-
-def _coerce_region(value) -> Region | None:
-    """把 winapi.virtual_screen() 的返回值统一成 (l, t, w, h)（防御式兼容）。"""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        if all(k in value for k in ("left", "top", "width", "height")):
-            return tuple(int(value[k]) for k in ("left", "top", "width", "height"))  # type: ignore[return-value]
-        return None
-    if hasattr(value, "left") and hasattr(value, "width"):
-        try:
-            return (int(value.left), int(value.top), int(value.width), int(value.height))
-        except Exception:  # noqa: BLE001
-            return None
-    try:
-        parts = tuple(int(v) for v in value)
-    except Exception:  # noqa: BLE001
-        return None
-    return parts if len(parts) == 4 else None  # type: ignore[return-value]
-
-
-def virtual_screen_rect() -> Region:
-    """整个虚拟桌面（多屏合并，含负坐标）。
-
-    首选 `winapi.virtual_screen()`（AG-A 提供，能拿到左侧/上方副屏的负坐标）；
-    拿不到时退回 `mss.monitors[0]` —— 注意不能退回 `GetSystemMetrics(0/1)`，
-    那两个值只是主屏尺寸，副屏会被漏掉。
-    """
-    try:
-        from src import winapi
-
-        fn = getattr(winapi, "virtual_screen", None)
-        if callable(fn):
-            got = _coerce_region(fn())
-            if got and got[2] > 0 and got[3] > 0:
-                return got
-    except Exception:  # noqa: BLE001
-        pass
-
-    try:
-        import mss
-
-        with mss.mss() as sct:
-            mon = sct.monitors[0]
-            return (int(mon["left"]), int(mon["top"]), int(mon["width"]), int(mon["height"]))
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"拿不到虚拟桌面尺寸：{type(exc).__name__}: {exc}") from exc
-
-
-def _geometry(size: Region) -> str:
-    """把 (l, t, w, h) 拼成 Tk 的 geometry 串。
-
-    Tk 的 geometry 语法里负 x/y 表示「距屏幕右/下边缘」，不能表达副屏的负坐标。
-    所以负坐标时改用无符号绝对定位 `+abs(x)+abs(y)` 再让 Win32 兜底不可行，
-    这里退化为覆盖主屏起点 (0,0) —— 结果坐标仍取 x_root/y_root，不影响正确性，
-    只是副屏区域可能在覆盖层之外。真机上遇到多屏偏移时，用 --region 直接给坐标更稳。
-    """
-    left, top, width, height = size
-    if left < 0 or top < 0:
-        return f"{width}x{height}+0+0"
-    return f"{width}x{height}+{left}+{top}"
-
-
-# --------------------------------------------------------------------- 全屏框选
-
-
-def rect_from_points(x0: int, y0: int, x1: int, y1: int) -> Region | None:
-    """把按下/松开两个屏幕点变成合法区域；宽或高小于下限视为误触，返回 None。
-
-    单独抽成函数是为了能脱离鼠标事件测试这段判断（框选交互本身没法自动化）。
-    坐标允许为负（副屏在主屏左侧时，x 就是负的）。
-    """
-    left, top = min(x0, x1), min(y0, y1)
-    width, height = abs(x1 - x0), abs(y1 - y0)
-    if width < MIN_SELECTION or height < MIN_SELECTION:
-        return None
-    return (int(left), int(top), int(width), int(height))
-
-
-def select_region() -> Region | None:
-    """全屏半透明覆盖层上拖拽框选，返回物理像素 (x, y, w, h)；取消返回 None。
-
-    交互：按住左键拖 → 红框 + 亮区 + 实时尺寸；松手确认；ESC / 右键取消。
-    """
-    tk, _, _, _ = _load_tk()
-    from src import winapi
-
-    # 必须早于 tk.Tk()：声明 DPI 感知后 tk 的坐标才和 mss 的物理像素对齐
-    winapi.enable_dpi_awareness()
-    screen = virtual_screen_rect()
-
-    root = tk.Tk()
-    root.withdraw()  # 主窗口只用来承载 Toplevel，本身不显示
-    overlay = None
-    try:
-        overlay = tk.Toplevel(root)
-        overlay.overrideredirect(True)  # 无边框，铺满桌面
-        overlay.geometry(_geometry(screen))
-        overlay.attributes("-topmost", True)
-        overlay.attributes("-alpha", 0.28)  # 半透明：既压暗桌面又能看清下面的内容
-        overlay.configure(bg="#0b0b0f")
-
-        canvas = tk.Canvas(
-            overlay, bg="#0b0b0f", highlightthickness=0, bd=0, cursor="crosshair"
-        )
-        canvas.pack(fill="both", expand=True)
-
-        canvas.create_text(
-            24, 20,
-            text="拖拽框选要滚动的区域 · 松开确认 · ESC 或右键取消",
-            fill="#f0f0f0", anchor="nw", font=("Microsoft YaHei", 12, "bold"),
-        )
-
-        state = {"x0": 0, "y0": 0, "dragging": False}
-        result: dict[str, Region | None] = {"region": None}
-
-        def redraw(x0: int, y0: int, x1: int, y1: int) -> None:
-            """按 canvas 局部坐标重画选框。
-
-            用 event.x/event.y（窗口内局部坐标）而不是 x_root/y_root 来画，
-            这样覆盖层实际落在屏幕哪个位置都不影响画面正确性。
-            """
-            canvas.delete("sel")
-            left, top = min(x0, x1), min(y0, y1)
-            right, bottom = max(x0, x1), max(y0, y1)
-            if right - left <= 0 or bottom - top <= 0:
-                return
-            # 亮区：整体半透明的前提下叠一块白，视觉上就是「这块比周围亮」
-            canvas.create_rectangle(
-                left, top, right, bottom, outline="", fill="#ffffff", tags="sel"
-            )
-            canvas.create_rectangle(
-                left, top, right, bottom,
-                outline="#ff2d2d", width=1, tags="sel",
-            )  # 1px 红框，不遮内容
-            # 尺寸标签贴在选框左上角外侧；用一块深色底衬保证任何背景上都读得清
-            label = f"{right - left} x {bottom - top}"
-            tx, ty = left, max(2, top - 20)
-            tid = canvas.create_text(
-                tx + 4, ty + 2, text=label, fill="#ffd7d7", anchor="nw",
-                font=("Consolas", 11, "bold"), tags="sel",
-            )
-            box = canvas.bbox(tid)
-            if box:
-                bg = canvas.create_rectangle(
-                    box[0] - 3, box[1] - 1, box[2] + 3, box[3] + 1,
-                    outline="", fill="#1a1a20", tags="sel",
-                )
-                canvas.tag_lower(bg, tid)
-            canvas.tag_raise("sel")
-
-        def on_press(event) -> None:
-            state["dragging"] = True
-            state["x0"], state["y0"] = event.x_root, event.y_root
-            canvas.delete("sel")
-            redraw(event.x, event.y, event.x, event.y)
-
-        def on_motion(event) -> None:
-            if not state["dragging"]:
-                return
-            x0 = state["x0"] - overlay.winfo_rootx()
-            y0 = state["y0"] - overlay.winfo_rooty()
-            redraw(x0, y0, event.x, event.y)
-
-        def on_release(event) -> None:
-            if not state["dragging"]:
-                return
-            state["dragging"] = False
-            region = rect_from_points(state["x0"], state["y0"], event.x_root, event.y_root)
-            if region is None:
-                # 误触保护：手抖点一下就会产生 1x1 的区域，直接忽略这次拖拽，
-                # 留在框选模式让用户重来（不退出、不报错）
-                canvas.delete("sel")
-                return
-            result["region"] = region
-            canvas.quit()  # 结束 mainloop
-
-        def on_cancel(_event=None) -> None:
-            result["region"] = None
-            canvas.quit()
-
-        canvas.bind("<ButtonPress-1>", on_press)
-        canvas.bind("<B1-Motion>", on_motion)
-        canvas.bind("<ButtonRelease-1>", on_release)
-        canvas.bind("<ButtonPress-3>", on_cancel)  # 右键取消
-        for widget in (overlay, canvas):
-            widget.bind("<Escape>", on_cancel)
-
-        overlay.lift()
-        overlay.update_idletasks()
-        # overrideredirect 窗口不会被系统自动激活，而 ESC/右键的关键是能收到键盘事件；
-        # grab_set 把整个桌面的输入都收进这块覆盖层，避免用户误点到下层窗口。
-        for attempt in (overlay.grab_set, overlay.focus_force, canvas.focus_set):
-            try:
-                attempt()
-            except Exception:  # noqa: BLE001 - 个别 WM 上 grab 会失败，降级为仅置顶
-                pass
-        canvas.mainloop()
-        return result["region"]
-    finally:
-        # 一定要销毁：留一个隐形全屏 topmost 窗口会挡住整个桌面，
-        # 用户看到的现象是「电脑卡死了但其实鼠标能动」。
-        for widget in (overlay, root):
-            try:
-                if widget is not None:
-                    widget.destroy()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 # --------------------------------------------------------------------- 工具函数
@@ -319,8 +117,8 @@ def main() -> int:
     root = tk.Tk()
     base_title = "LongShot2PDF · 滚动截长图 / 连续截图整合"
     root.title(base_title)
-    root.geometry("700x820")
-    root.minsize(660, 760)
+    root.geometry("720x900")
+    root.minsize(680, 720)
 
     style = ttk.Style(root)
     for theme in ("vista", "winnative", "clam"):
@@ -874,6 +672,9 @@ def main() -> int:
         root=root,
         can_capture=lambda: shots_tab_active() and not state["running"],
     )
+    # 挂到 root 上：关窗时要调它的 shutdown()（停掉 F9 轮询），
+    # 版式审计脚本也能直接拿到面板句柄。
+    root._shots_panel = shots_panel
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh_region_text()

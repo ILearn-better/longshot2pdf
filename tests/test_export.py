@@ -201,12 +201,17 @@ def texty_shot(width: int = 1200, height: int = 900) -> Shot:
 def case_scan_export(tmp: Path) -> None:
     print("\n[5] 扫描效果一路传到文件")
     shots = [texty_shot()]
+    # 固定 1× 清晰度作为对照：这里验的是「颗粒让 JPEG 涨多少」，
+    # 混进像素倍数就分不清是滤镜还是密度在影响体积了。
     plain = export_document(
-        shots, Layout(size_mode="width", target_px=1000), tmp / "plain.pdf", "pdf"
+        shots,
+        Layout(size_mode="width", target_px=1000, hi_res=1.0),
+        tmp / "plain.pdf",
+        "pdf",
     )
     scanned = export_document(
         shots,
-        Layout(size_mode="width", target_px=1000, scan=True, scan_strength=50),
+        Layout(size_mode="width", target_px=1000, hi_res=1.0, scan=True, scan_strength=50),
         tmp / "scan.pdf",
         "pdf",
     )

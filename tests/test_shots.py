@@ -9,6 +9,7 @@
 6. estimate_pages 不解码像素（大图估算也在毫秒级，滑杆才拖得动）
 7. 扫描效果的形状/类型/确定性/强度单调性
 8. 越界参数被 normalized 收口，超限页面给出明确报错
+9. 输出清晰度：嵌入像素只多不少，且绝不放大超过原图
 
 直接运行：  python tests/test_shots.py
 """
@@ -30,11 +31,14 @@ from src.shots import (  # noqa: E402
     Layout,
     Shot,
     apply_scan,
+    embed_scale,
+    estimate_dpi,
     estimate_pages,
     estimate_size,
     prepare,
     render_pages,
     resize_to,
+    resize_to_width,
     target_size,
 )
 
@@ -83,7 +87,7 @@ def case_uniform_after_resize() -> None:
     print("\n[2] 尺寸对齐后长宽一致")
     shots = sample_shots()
     for mode, target, attr in (("width", 1200, "width"), ("height", 700, "height")):
-        lay = Layout(size_mode=mode, target_px=target)
+        lay = Layout(size_mode=mode, target_px=target, hi_res=1.0)
         placed = prepare(shots, lay)
         values = {getattr(p, attr) for p in placed}
         assert values == {target}, f"{mode} 模式未统一: {sorted(values)}"
@@ -91,7 +95,7 @@ def case_uniform_after_resize() -> None:
               f"，高度/宽度依次为 {[p.height if attr=='width' else p.width for p in placed]}")
 
     # 保持原始：尺寸一张都不许动
-    placed = prepare(shots, Layout(size_mode="original"))
+    placed = prepare(shots, Layout(size_mode="original", hi_res=1.0))
     assert [(p.width, p.height) for p in placed] == [(1600, 900), (1000, 1000), (1000, 400)]
     print("      original 模式：尺寸原样保留")
 
@@ -100,17 +104,17 @@ def case_align() -> None:
     print("\n[3] 位置对齐：左 / 中 / 右")
     shots = sample_shots()
     # 用 original 模式才能看出对齐差异（统一宽度后所有图一样宽，偏移恒为 0）
-    base = Layout(size_mode="original", align="left")
+    base = Layout(size_mode="original", align="left", hi_res=1.0)
     left = prepare(shots, base)
-    middle = prepare(shots, Layout(size_mode="original", align="center"))
-    right = prepare(shots, Layout(size_mode="original", align="right"))
+    middle = prepare(shots, Layout(size_mode="original", align="center", hi_res=1.0))
+    right = prepare(shots, Layout(size_mode="original", align="right", hi_res=1.0))
 
     content_w = max(s.width for s in shots)  # 1600
     assert [p.x for p in left] == [0, 0, 0], left
     assert [p.x for p in middle] == [0, 300, 300], [p.x for p in middle]
     assert [p.x for p in right] == [0, 600, 600], [p.x for p in right]
     for mode in ALIGN_MODES:
-        placed = prepare(shots, Layout(size_mode="original", align=mode))
+        placed = prepare(shots, Layout(size_mode="original", align=mode, hi_res=1.0))
         for p in placed:
             assert 0 <= p.x <= content_w - p.width, f"{mode}: x={p.x} 越界"
     print(f"      内容宽 {content_w}，左 {[p.x for p in left]} "
@@ -120,7 +124,7 @@ def case_align() -> None:
 def case_paging() -> None:
     print("\n[4] 排布：每图一页 / 连续排列")
     shots = sample_shots()
-    lay = Layout(size_mode="width", target_px=1000, margin_px=20)
+    lay = Layout(size_mode="width", target_px=1000, margin_px=20, hi_res=1.0)
     pages = render_pages(shots, lay)
     assert len(pages) == len(shots), f"每图一页应为 {len(shots)} 页，得到 {len(pages)}"
     widths = {p.shape[1] for p in pages}
@@ -133,7 +137,7 @@ def case_paging() -> None:
           f"{[p.shape[0] for p in pages]}")
 
     lay = Layout(size_mode="width", target_px=1000, margin_px=20, gap_px=10,
-                 paging="flow", page_ratio=1.414)
+                 paging="flow", page_ratio=1.414, hi_res=1.0)
     flow = render_pages(shots, lay)
     assert len(flow) >= 1
     sizes = {(p.shape[1], p.shape[0]) for p in flow}
@@ -179,7 +183,7 @@ def case_estimate_is_cheap() -> None:
 
     size = estimate_size(shots, lay)
     assert size == (1600, 1200), size
-    assert prepare(shots, lay)[0].width == size[0]
+    assert prepare(shots, lay)[0].logical_width == size[0]
     print(f"      统一后尺寸 {size} 与实际渲染一致")
 
 
@@ -249,6 +253,77 @@ def case_bad_params() -> None:
         raise AssertionError("超宽页未报错")
 
 
+def case_resolution() -> None:
+    """清晰度：嵌入像素只多不少，但**绝不凭空放大**。"""
+    print("\n[9] 输出清晰度：只少缩、不虚放")
+    lay = Layout(size_mode="width", target_px=1200)
+
+    # 1080p 截图排版到 1200：1× 会缩到 1200，2× 用满 1920 原生像素
+    hd = [shot(1920, 1080)]
+    got = {}
+    for hi in (1.0, 2.0, 3.0):
+        p = prepare(hd, Layout(size_mode="width", target_px=1200, hi_res=hi))[0]
+        got[hi] = p.width
+        assert p.logical_width == 1200, f"hi={hi} 排版宽度被改了: {p.logical_width}"
+    assert got == {1.0: 1200, 2.0: 1920, 3.0: 1920}, got
+    print(f"      1080p 源图 → 嵌入宽度 {got}（2×/3× 都停在原生 1920）")
+
+    # 4K 源图：被 hi_res 挡住，不会白白塞进 3840
+    uhd = [shot(3840, 2160)]
+    for hi, expect in ((1.0, 1200), (2.0, 2400), (3.0, 3600)):
+        p = prepare(uhd, Layout(size_mode="width", target_px=1200, hi_res=hi))[0]
+        assert p.width == expect, (hi, p.width, expect)
+    print("      4K 源图 → 1200 / 2400 / 3600（随档位，最高 3×）")
+
+    # 源图比排版尺寸还小：清晰度倍数不会在「排版放大」之上再叠一层
+    # （把 600 撑到 1200 是用户选的「统一宽度」，不是清晰度擅自决定的）
+    small = [shot(600, 400)]
+    for hi in (1.0, 2.0, 3.0):
+        p = prepare(small, Layout(size_mode="width", target_px=1200, hi_res=hi))[0]
+        assert p.width == 1200, (hi, p.width)
+    assert embed_scale(small[0], Layout(size_mode="width", target_px=1200)) == 1.0
+    keep = prepare(small, Layout(size_mode="original", hi_res=3.0))[0]
+    assert (keep.width, keep.height) == (600, 400), (keep.width, keep.height)
+    print("      600px 源图：统一宽度撑到 1200 后不再叠加放大；original 模式 600 不动")
+
+    # 版式与页数不随清晰度变化 —— 这是「提高分辨率」而不是「把图放大」
+    shots = sample_shots()
+    base = None
+    for hi in (1.0, 2.0, 3.0):
+        lay = Layout(size_mode="width", target_px=1000, hi_res=hi)
+        shape = [
+            (p.logical_width, p.logical_height) for p in prepare(shots, lay)
+        ]
+        pages = len(render_pages(shots, lay))
+        if base is None:
+            base = (shape, pages)
+        assert (shape, pages) == base, f"hi={hi} 改动了版式/页数: {(shape, pages)}"
+    print(f"      1×/2×/3× 的排版尺寸与页数完全相同（{base[1]} 页）")
+
+    # PDF 页面的**物理**比例不变：像素多了，纸上的大小一样
+    for hi in (1.0, 2.0):
+        page = render_pages(shots, Layout(size_mode="width", target_px=1000, hi_res=hi))[0]
+        ratio = page.shape[1] / page.shape[0]
+        if hi == 1.0:
+            first = ratio
+        else:
+            assert abs(ratio - first) < 0.01, f"页比例变了: {ratio} vs {first}"
+    print("      PDF 页面的宽高比不随清晰度变化")
+
+    # 等效分辨率提示：取最差的那张
+    # 最窄的那张（1000px）排版到 500 时能到 2×，所以整批按 192dpi 报
+    dpi = estimate_dpi(shots, Layout(size_mode="width", target_px=500))
+    assert abs(dpi - 192.0) < 1.0, dpi
+    print(f"      estimate_dpi = {dpi:.0f} dpi（取最差一张）")
+
+    # 「输出宽度」：等比缩放，宽度已一致时零开销
+    img = np.zeros((400, 800, 3), np.uint8)
+    assert resize_to_width(img, 800) is img
+    assert resize_to_width(img, 1600).shape == (800, 1600, 3)
+    assert resize_to_width(img, 400).shape == (200, 400, 3)
+    print("      resize_to_width：800→1600/400 等比，等宽时零拷贝")
+
+
 def main() -> int:
     print("=" * 64)
     print("连续截图整合 · 几何与滤镜")
@@ -262,6 +337,7 @@ def main() -> int:
         case_estimate_is_cheap()
         case_scan()
         case_bad_params()
+        case_resolution()
     except AssertionError as exc:
         print(f"\n[FAIL] {exc}")
         return 1
