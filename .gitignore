@@ -1,0 +1,46 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 本项目运行产物（不入库）----------
+# 采集时切出的单页 JPEG、临时目录、最终导出的 PDF 都属于运行结果
+output/
+out/
+longshot_*/
+tests/_tmp_pages/
+tests/_tmp_out.pdf
+*.tmp
+*.temp
+
+# 导出的 PDF 一律忽略，docs 下的示意图除外
+*.pdf
+!docs/**/*.pdf
+
+# ---------- 日志与本地配置 ----------
+*.log
+.env
+.env.*
+config.local.*
+settings.local.*
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
