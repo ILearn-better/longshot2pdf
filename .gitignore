@@ -19,6 +19,7 @@ ENV/
 # 采集时切出的单页 JPEG、临时目录、最终导出的 PDF 都属于运行结果
 output/
 out/
+demo/
 longshot_*/
 tests/_tmp_pages/
 tests/_tmp_pipeline/

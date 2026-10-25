@@ -21,25 +21,33 @@
 
 ## 快速开始
 
+**Windows：双击 `start.bat`**（macOS/Linux：`./start.sh`）。第一次会自建 `.venv` 并装依赖，
+装完就出界面；之后每次双击直接进界面，约 1 秒。
+
+不想双击就用统一入口，它和 `start.bat` 是同一套逻辑：
+
 ```bash
-pip install -r requirements.txt
-
-# 图形界面：框选 → 一键出 PDF
-python gui.py
-
-# 命令行：指定区域
-python cli.py --region 100,200,1200,900 --out 长图.pdf
-
-# 命令行：全屏框选后再采集
-python cli.py --select --out 长图.pdf
-
-# 先看看会做什么，不真的截
-python cli.py --dry-run --region 0,0,1200,900 --out /tmp/x.pdf
+python run.py                                     # 图形界面：框选 → 一键出 PDF
+python run.py --region 100,200,1200,900 --out 长图.pdf
+python run.py --select --out 长图.pdf             # 全屏框选后再采集
+python run.py --dry-run --region 0,0,1200,900     # 只打印计划，不真截
+python run.py --doctor                            # 环境体检
 ```
+
+`run.py` 只用标准库，不需要先装任何东西。它负责把「环境问题」和「程序问题」分开：
+
+| 你遇到的 | 直接跑会报的错 | run.py 的处理 |
+|---|---|---|
+| PATH 上的 Python 没依赖 | `No module named 'mss'` | 自动挑出可用的解释器并建隔离环境 |
+| 用的是没有 tkinter 的 Python | `No module named '_tkinter'` | 换到带 tkinter 的解释器；换不到就走命令行 |
+| Python < 3.9 | `'type' object is not subscriptable` | 启动前拦住，直接说要装哪个版本 |
+
+依赖装到项目自己的 `.venv` 里，**不会污染系统 Python 或 conda base**。
+装依赖失败时会打印可复制的镜像命令，不会留下半截环境（`.venv` 用 `--clear` 重建）。
 
 采集过程中按 **ESC** 或点「停止」都会立刻停止，并把已采到的内容导出成半成品 PDF。
 
-常用参数：
+常用参数（`run.py` 与 `cli.py` 共用同一套参数表）：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -49,10 +57,16 @@ python cli.py --dry-run --region 0,0,1200,900 --out /tmp/x.pdf
 | `--strip-top` / `--strip-bottom` | 0 | 剔除固定表头 / 底栏的像素数 |
 | `--max-pages` | 0 | 页数上限，0 为不限 |
 
+启动器专用参数：`--venv` 强制重建 `.venv`、`--no-install` 只看不装、
+`--no-switch` 禁止自动换解释器、`--help` 查看全部。
+
 ## 项目结构
 
 ```
 longshot2pdf/
+├── start.bat            双击启动（Windows，纯 ASCII，避免 cmd 编码坑）
+├── start.sh             双击启动（macOS/Linux）
+├── run.py               启动器：找解释器 / 建 venv / 装依赖 / 体检
 ├── docs/开发文档.md     需求还原、技术方案、踩坑清单、角色分工、v0.2 变更记录
 ├── src/
 │   ├── winapi.py        全局滚轮投递 / 光标定位 / DPI 感知 / 虚拟桌面
@@ -92,7 +106,11 @@ python tests/run_all.py
 
 ## 环境
 
-Python 3.13 · `mss` `numpy` `Pillow` `img2pdf`（`pypdf` 仅测试用）
+Python 3.9+（实测 3.11 / 3.13）· `mss` `numpy` `Pillow` `img2pdf`（`pypdf` 仅测试用）。
+需要带 tkinter 的 CPython 才能开界面；没有也能用命令行。
+
+先体检再排查：`python run.py --doctor` 会把「机器上有哪些解释器、各自缺什么、
+能不能截屏、Tk 能不能建窗口」一次列清。
 
 ## 更多
 
