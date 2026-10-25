@@ -17,18 +17,35 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SUITES = ["test_stitch.py", "test_probe.py", "test_pipeline.py"]
+SUITES = ["test_stitch.py", "test_probe.py", "test_pipeline.py", "test_gui_hide.py"]
+
+# 界面那条需要 tkinter：嵌入版 / 精简版 Python 没有它，
+# 这种环境里跳过而不是判失败 —— 采集内核本身跟 tkinter 无关。
+NEEDS_TK = {"test_gui_hide.py"}
+
+
+def _has_tk() -> bool:
+    try:
+        import tkinter  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def main() -> int:
     py = sys.executable
     failed: list[str] = []
     total = 0.0
+    has_tk = _has_tk()
 
     for name in SUITES:
         path = ROOT / "tests" / name
         if not path.exists():
             print(f"\n[SKIP] {name} 不存在")
+            continue
+        if name in NEEDS_TK and not has_tk:
+            print(f"\n[SKIP] {name}（当前解释器没有 tkinter）")
             continue
         print(f"\n===== {name} =====")
         t0 = time.perf_counter()

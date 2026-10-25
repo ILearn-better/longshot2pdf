@@ -317,9 +317,10 @@ def main() -> int:
     winapi.enable_dpi_awareness()
 
     root = tk.Tk()
-    root.title("LongShot2PDF · 滚动截长图转 PDF")
-    root.geometry("660x720")
-    root.minsize(620, 680)
+    base_title = "LongShot2PDF · 滚动截长图转 PDF"
+    root.title(base_title)
+    root.geometry("660x760")
+    root.minsize(620, 700)
 
     style = ttk.Style(root)
     for theme in ("vista", "winnative", "clam"):
@@ -339,6 +340,7 @@ def main() -> int:
         "started_at": 0.0,
         "pdf": None,
         "close_when_done": False,
+        "hidden": False,      # 面板当前是否被最小化（采集期间）
     }
 
     outer = ttk.Frame(root, padding=12)
@@ -449,6 +451,20 @@ def main() -> int:
     idle_var = tk.IntVar(value=60)
     add_spin(8, "无滚动收尾", idle_var, 0, 3600, "秒，仅手动模式；0 = 一直等（按 ESC 结束）")
 
+    # ---- 开始时是否让开画面 ----
+    # 面板只要还摆在屏幕上，就必然出现在每一帧里（尤其框选覆盖整个窗口时）。
+    # 默认最小化：屏幕上干干净净，但它仍在任务栏里，点一下就能还原 ——
+    # 不用 withdraw 是因为那样连任务栏入口都没了，万一 ESC 不好使就彻底没退路。
+    hide_var = tk.BooleanVar(value=True)
+    chk_hide = ttk.Checkbutton(
+        box_param, text="开始后最小化面板", variable=hide_var,
+    )
+    chk_hide.grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    param_widgets.append(chk_hide)
+    ttk.Label(
+        box_param, text="避免面板被截进画面；点任务栏图标可随时还原", foreground="#888888"
+    ).grid(row=9, column=3, sticky="w", padx=(6, 0))
+
     # ---------------- 操作 ----------------
     box_action = ttk.Frame(outer)
     box_action.pack(fill="x", pady=(12, 0))
@@ -541,7 +557,15 @@ def main() -> int:
         for widget in widgets:
             try:
                 if isinstance(
-                    widget, (ttk.Scale, ttk.Spinbox, ttk.Entry, ttk.Button, ttk.Radiobutton)
+                    widget,
+                    (
+                        ttk.Scale,
+                        ttk.Spinbox,
+                        ttk.Entry,
+                        ttk.Button,
+                        ttk.Radiobutton,
+                        ttk.Checkbutton,
+                    ),
                 ):
                     widget.state(["!disabled"] if enabled else ["disabled"])
             except Exception:  # noqa: BLE001
@@ -638,17 +662,63 @@ def main() -> int:
         if ignored:
             status_var.set(f"提示：pipeline 暂不支持 {', '.join(ignored)}，已忽略")
 
-        thread = threading.Thread(
-            target=worker, args=(cfg, state["queue"], state["stop"]),
-            daemon=True, name="longshot-gui-run",
+        def start_worker() -> None:
+            thread = threading.Thread(
+                target=worker, args=(cfg, state["queue"], state["stop"]),
+                daemon=True, name="longshot-gui-run",
+            )
+            state["thread"] = thread
+            thread.start()
+            root.after(80, poll)
+
+        def minimize_then_run() -> None:
+            try:
+                root.iconify()
+                root.update_idletasks()
+            except tk.TclError:
+                pass
+            # 最小化有个约 200ms 的窗口动画。动画没结束就抓首帧，
+            # 会把「正在缩下去的面板」拍进第一帧 —— 后面所有帧都以首帧为基准，
+            # 那一小块污点会在整页里留下一条不该有的痕迹。
+            root.after(320, start_worker)
+
+        if not bool(hide_var.get()):
+            start_worker()
+            return
+
+        # 先把「要最小化了」画出来，再动手。
+        # 否则用户只看到窗口一闪就没了，分不清是开始采集还是程序崩了。
+        # 顺带把「接下来该干什么」写在同一句里 —— 最小化之后这句话就看不见了。
+        state["hidden"] = True
+        status_var.set(
+            "面板即将最小化，现在请自己滚动页面；按 ESC 停止，点任务栏图标可还原"
+            if manual
+            else "面板即将最小化，正在自动滚动；按 ESC 停止，点任务栏图标可还原"
         )
-        state["thread"] = thread
-        thread.start()
-        root.after(80, poll)
+        root.update_idletasks()
+        root.after(220, minimize_then_run)
 
     def finish_ui(result, exc: BaseException | None = None) -> None:
         state["running"] = False
         bar.stop()
+
+        # 面板可能还处于最小化状态：先还原，否则用户根本看不到结果，
+        # 也点不到「打开 PDF」—— 采集成功却像是卡住了。
+        if state.get("hidden"):
+            state["hidden"] = False
+            try:
+                root.deiconify()
+                root.lift()
+                root.attributes("-topmost", True)
+                # 短暂置顶把它顶到目标程序前面，再取消，避免长期压住别的窗口
+                root.after(600, lambda: root.attributes("-topmost", False))
+            except tk.TclError:
+                pass
+        try:
+            root.title(base_title)
+        except tk.TclError:
+            pass
+
         set_param_state(True)
         btn_stop.state(["disabled"])
         elapsed = time.monotonic() - state["started_at"]
@@ -696,6 +766,12 @@ def main() -> int:
                     frames, pages, rows, note = payload
                     count_var.set(f"帧 {frames} · 页 {pages} · 行 {rows}")
                     status_var.set(str(note))
+                    # 面板最小化时看不到进度，把它写进标题：任务栏按钮上能直接读到
+                    if state.get("hidden"):
+                        try:
+                            root.title(f"采集中 · 帧 {frames} · {pages} 页 · 按 ESC 停止")
+                        except tk.TclError:
+                            pass
                 elif kind == "done":
                     finish_ui(payload)
                 elif kind == "error":
@@ -729,10 +805,26 @@ def main() -> int:
 
     def on_close() -> None:
         if state["running"]:
+            # 面板可能还最小化着：弹窗会躲在后面看不见，先还原再问
+            was_hidden = bool(state.get("hidden"))
+            if was_hidden:
+                state["hidden"] = False
+                try:
+                    root.deiconify()
+                    root.lift()
+                except tk.TclError:
+                    pass
             if not messagebox.askyesno(
                 "正在采集",
                 "采集尚未结束，确定要停止并退出吗？\n已采集的内容仍会尝试导出为半成品 PDF。",
             ):
+                # 用户决定继续采 → 面板得重新让开，否则接下来每一帧都会拍到它
+                if was_hidden:
+                    try:
+                        root.iconify()
+                    except tk.TclError:
+                        pass
+                    state["hidden"] = True
                 return
             state["close_when_done"] = True
             state["stop"].set()

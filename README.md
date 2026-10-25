@@ -71,6 +71,10 @@ python run.py --doctor                            # 环境体检
 
 采集过程中按 **ESC** 或点「停止」都会立刻停止，并把已采到的内容导出成半成品 PDF。
 
+点「开始」后**面板会自动最小化**（可在界面上关掉），避免它出现在截取区域里 ——
+采集期间任务栏标题会实时显示「帧 N · N 页」，点任务栏图标可随时还原，
+按 ESC 也能停。采集结束后面板自动还原并顶到前面。
+
 常用参数（`run.py` 与 `cli.py` 共用同一套参数表）：
 
 | 参数 | 默认 | 说明 |
@@ -108,6 +112,7 @@ longshot2pdf/
     ├── test_stitch.py   拼接内核
     ├── test_probe.py    探测与归位
     ├── test_pipeline.py 端到端（不用真实屏幕）
+    ├── test_gui_hide.py 界面：开始后让开画面（打桩事件循环）
     └── run_all.py       一键跑完
 ```
 
@@ -117,7 +122,7 @@ longshot2pdf/
 python tests/run_all.py
 ```
 
-三套测试全部离线运行，不需要真实鼠标和屏幕。`tests/mock_frames.py` 里的
+四套测试全部离线运行，不需要真实鼠标和屏幕（界面那套需要带 tkinter 的解释器，没有会自动跳过）。`tests/mock_frames.py` 里的
 `VirtualScreen` 把「长文档 + 滚动位置」伪装成一块屏幕，因此 500 页场景、
 惰性加载、固定底栏、ESC 中断这些现实问题都能在 CI 里反复验收。
 
