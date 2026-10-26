@@ -254,3 +254,7 @@ Python 3.9+（实测 3.11 / 3.13）· `mss` `numpy` `Pillow` `img2pdf`（`pypdf`
 ## 更多
 
 技术细节、踩坑清单、Agent 分工见 [docs/开发文档.md](docs/开发文档.md)。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 zhoulikun
