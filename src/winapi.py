@@ -198,6 +198,16 @@ def get_dpi_scale() -> float:
 # ------------------------------------------------------------------ 屏幕范围
 
 
+def available() -> bool:
+    """本模块的动作能不能真的执行（Windows 上是 True，其它平台 False）。
+
+    调用方用它来选「问 Win32」还是「问 mss」：非 Windows 上
+    ``virtual_screen()`` 会返回 (0,0,0,0)，此时应当改用 mss.monitors[0]，
+    而不是把 0 当成屏幕尺寸。
+    """
+    return user32 is not None
+
+
 def _metric(index: int, default: int = 0) -> int:
     if user32 is None:
         return default
@@ -212,6 +222,11 @@ def virtual_screen() -> tuple[int, int, int, int]:
 
     副屏在主屏左边时 x 为负（例如 (-1920, 0, 3840, 1080)），
     副屏在上边时 y 为负。调用方**不能**假设返回值的 x/y 是 0。
+
+    非 Windows 平台返回 ``(0, 0, 0, 0)`` —— 表示「问不到」，不是「屏幕是 0×0」。
+    这里**不能**退回 1920×1080：那会把 macOS/Linux 上的宽屏钉死在左上角一块，
+    2560 宽的屏幕右半边永远截不到。正确的做法是让调用方改问 mss.monitors[0]
+    （见 :func:`src.capture.normalize_region`）。
     """
     x = _metric(SM_XVIRTUALSCREEN, 0)
     y = _metric(SM_YVIRTUALSCREEN, 0)
@@ -226,7 +241,10 @@ def virtual_screen() -> tuple[int, int, int, int]:
     if pw > 0 and ph > 0:
         return 0, 0, pw, ph
 
-    # 回退 2：完全拿不到（非 Windows / 受限会话）
+    if user32 is None:
+        return 0, 0, 0, 0  # 非 Windows：交给调用方去问 mss
+
+    # 回退 2：Windows 但完全拿不到（受限会话 / 服务进程）
     return _FALLBACK_SCREEN
 
 

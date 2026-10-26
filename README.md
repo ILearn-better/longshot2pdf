@@ -193,6 +193,7 @@ longshot2pdf/
 │   ├── regionpick.py    全屏框选 + 区域位置/尺寸对齐（纯算术，可离线测）
 │   ├── shots.py         连续截图整合：尺寸/位置对齐、清晰度、拼版、扫描滤镜
 │   ├── docxwriter.py    手写 OOXML 生成 .docx（不引入 lxml / python-docx）
+│   ├── paths.py         路径口径：桌面定位、Windows 保留名、写盘错误转译
 │   └── shots_export.py  导出编排（Word / PDF 两条口径）
 ├── gui.py               tkinter 顶部导航 + 全屏框选 + 控制面板
 ├── shots_gui.py         「连续截图整合」面板（F9 轮询、列表、参数联动、导出状态）
@@ -201,6 +202,7 @@ longshot2pdf/
 │   └── make_demo.py     生成 demo/ 下的示例文档（不需要界面）
 └── tests/
     ├── mock_frames.py      合成文档 / 虚拟屏幕（离线测试地基）
+    ├── test_paths.py       路径口径：桌面、保留名、目标预检、错误转译、后缀
     ├── test_stitch.py      拼接内核
     ├── test_probe.py       探测与归位
     ├── test_region.py      截取区域：框选、收口、九宫格对齐、按比例改尺寸
@@ -218,9 +220,14 @@ longshot2pdf/
 python tests/run_all.py
 ```
 
-八套测试全部离线运行，不需要真实鼠标和屏幕（界面那两套需要带 tkinter 的解释器，没有会自动跳过）。`tests/mock_frames.py` 里的
+九套测试全部离线运行，不需要真实鼠标和屏幕（界面那两套需要带 tkinter 的解释器，没有会自动跳过）。`tests/mock_frames.py` 里的
 `VirtualScreen` 把「长文档 + 滚动位置」伪装成一块屏幕，因此 500 页场景、
 惰性加载、固定底栏、ESC 中断这些现实问题都能在 CI 里反复验收。
+
+`test_paths.py` 覆盖的是「文件存哪、存得成不成」这一层：桌面定位要跟随
+OneDrive 重定向、`CON.pdf` 这类保留设备名必须提前拦下（否则写出来是 0 字节）、
+超过 260 字符的路径要把 `WinError 206` 翻成「改短一点」、`报告.v2` 不能被
+当成后缀吃掉版本号。
 
 连续截图那四套同样不开界面也能验：`test_shots.py` 验几何与滤镜（含「预计页数 == 实际页数」
 的 12 组参数交叉验证），`test_export.py` 把 docx 当 ZIP 拆开数图片和分页符、用 pypdf 读回 PDF 页尺寸，
@@ -239,11 +246,39 @@ python tests/run_all.py
 | 系统缩放 100% 时框选 900px 宽 | 统一到 1200px 是插值放大 | 放大不增加细节，交付时按实际像素用即可（选「按区域原样」） |
 | 扫描效果的颗粒 | JPEG 压不动高频噪声，体积比彩色版大 5%~20% | 觉着大就调低强度；这是「扫描件」的代价，不是 bug |
 | 连续截图删掉中间一张 | 文档顺序跟着前移（序号重排） | 序号就是文档顺序，删完看一眼序号即可 |
+| 导出文件名撞上 `CON` / `PRN` / `COM1` 这类保留设备名 | 系统会把它当设备，写出来是 0 字节空壳 | 导出前预检直接拦下；万一漏过去，0 字节也会报错而不是说「已导出」 |
+| 输出路径超过 260 字符 | `WinError 206 文件名或扩展名太长` | 报错会说明「改短或开启长路径支持」，不再只吐原始错误码 |
+| 桌面被 OneDrive 重定向到 `~/OneDrive/Desktop` | 默认导出位置跟着走 | 用 Windows 已知文件夹定位，不再硬猜 `~/Desktop` |
+| 文件名写成 `报告.v2` | 保留版本号：`报告.v2.pdf` | 只有 `.pdf`/`.docx` 这类格式后缀才会被替换 |
 
 ## 环境
 
-Python 3.9+（实测 3.11 / 3.13）· `mss` `numpy` `Pillow` `img2pdf`（`pypdf` 仅测试用）。
+Python 3.9+ · `mss` `numpy` `Pillow` `img2pdf`（`pypdf` 仅测试用）。
 需要带 tkinter 的 CPython 才能开界面；没有也能用命令行。
+
+### 实测过的组合
+
+| Python | 依赖 | 结果 |
+|---|---|---|
+| 3.11.4 | **下限组合**：mss 10.0.0 · numpy 1.26.4 · Pillow 10.1.0 · img2pdf 0.5.1 | 九套全绿（含界面两套），62s |
+| 3.11.4 | mss 10.2 · numpy 2.0 · Pillow 10.3 · img2pdf 0.6.3 | 九套全绿（含界面两套），60s |
+| 3.13.14 | mss 10.2 · numpy 2.5 · Pillow 13.0 · img2pdf 0.6.3 | 九套全绿（界面两套因无 tkinter 跳过），49s |
+| 3.9 | — | 语法与运行时特性静态检查通过（本机无 3.9 解释器，未实跑） |
+
+依赖只钉下限（`mss>=10.0` 这类），所以 numpy 1.26→2.5、Pillow 10→13 都能装；
+代码里没有用到 numpy 2.0 移除的别名（`np.float_` / `np.int0` …），
+也没有 Pillow 10 移除的 `Image.ANTIALIAS` / `textsize`，跨这个大版本区间是安全的。
+
+### 跨平台
+
+- **Windows**：全部功能可用。滚轮投递、全局按键（ESC / F9）、Per-Monitor V2 DPI
+  都是 Win32 调用，这是项目的目标平台。
+- **macOS / Linux**：`start.sh` 能启动、界面能开、导出 Word/PDF 正常。
+  采集侧靠 mss（X11 / macOS 需授予屏幕录制权限），**自动滚动与 F9 不可用**
+  （`winapi` 的 user32 不存在，投递滚轮会抛 OSError）。
+  手动滚（`--manual`）可跑：位移由你自己滚，拼接算法与平台无关，
+  ESC 轮询退化为不可用，用 `--idle-timeout` 或「停止」收尾。
+  屏幕尺寸在非 Windows 上改问 `mss.monitors[0]`，不再被钉死在 1920×1080。
 
 导出 Word **不需要 python-docx**：`src/docxwriter.py` 直接拼 OOXML（ZIP + XML），
 所以没有 lxml 这个 C 扩展依赖 —— 那条路在没装编译器的 Windows 上正是最容易断的一环。

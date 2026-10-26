@@ -19,6 +19,22 @@ Region = tuple[int, int, int, int]  # (left, top, width, height) 物理像素
 MIN_SIDE = 2  # 小于 2px 的区域没有采集/匹配意义
 
 
+def _screen_from_mss() -> Region:
+    """问 mss 要虚拟桌面范围（非 Windows 平台拿不到 Win32 信息时用它）。
+
+    mss 的 ``monitors[0]`` 就是「所有显示器合并后的矩形」，语义与
+    Win32 的 ``SM_XVIRTUALSCREEN`` 一致，负坐标也照给。
+    """
+    with new_session() as sct:
+        mon = sct.monitors[0]
+    return (
+        int(mon["left"]),
+        int(mon["top"]),
+        int(mon["width"]),
+        int(mon["height"]),
+    )
+
+
 def normalize_region(region: Region, screen: Region | None = None) -> Region:
     """把区域裁剪进虚拟桌面范围，返回合法区域；完全落在屏幕外抛 ValueError。
 
@@ -30,7 +46,7 @@ def normalize_region(region: Region, screen: Region | None = None) -> Region:
     参数
     ----
     region : (left, top, w, h)，left/top 可为负
-    screen : 覆盖用的桌面范围，默认取 ``winapi.virtual_screen()``（便于离线测试）
+    screen : 覆盖用的桌面范围；默认先问 winapi，问不到（非 Windows）再问 mss
     """
     try:
         left, top, width, height = (int(v) for v in region)
@@ -41,6 +57,9 @@ def normalize_region(region: Region, screen: Region | None = None) -> Region:
 
     if screen is None:
         screen = winapi.virtual_screen()
+        if screen[2] <= 0 or screen[3] <= 0:
+            # 非 Windows 上 winapi 返回 (0,0,0,0)，含义是「问不到」而不是「屏幕为 0」
+            screen = _screen_from_mss()
     try:
         sx, sy, sw, sh = (int(v) for v in screen)
     except (TypeError, ValueError):
@@ -58,12 +77,15 @@ def normalize_region(region: Region, screen: Region | None = None) -> Region:
     return (x0, y0, cw, ch)
 
 
-def _new_sct():
+def new_session():
     """创建一个 mss 截屏会话。
 
     mss 10.2 起 `mss.mss()` 已弃用、`MSS` 类取而代之，直接调用会在每次创建时
     往 stderr 打一行 DeprecationWarning —— 而截图是每帧都做的事，这行警告会
     把真正的错误挤出终端。所以优先用新 API，旧版本回退。
+
+    单独暴露成公共函数是为了让 cli 的 ``--fullscreen`` 也走同一条路径：
+    两处各写一份 `mss.mss()` 最容易出现「一处升级了另一处忘了」。
     """
     factory = getattr(mss, "MSS", None) or getattr(mss, "mss")
     return factory()
@@ -71,7 +93,7 @@ def _new_sct():
 
 class Grabber:
     def __init__(self) -> None:
-        self._sct: mss.base.MSSBase | None = _new_sct()
+        self._sct: mss.base.MSSBase | None = new_session()
 
     def grab(self, region: Region) -> np.ndarray:
         """截取区域，返回 (H, W, 3) uint8 RGB 数组。

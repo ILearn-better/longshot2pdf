@@ -33,6 +33,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# 纯标准库，不碰 numpy/mss，所以放在顶层不影响 `--help` 的可用性
+from src import paths  # noqa: E402
+
 EXIT_OK = 0
 EXIT_BAD_INPUT = 2
 EXIT_RUNTIME_ERROR = 3
@@ -245,9 +248,11 @@ def virtual_screen_region() -> Region:
         pass
 
     try:
-        import mss
+        # 与 src/capture.py 共用同一个会话工厂：mss 10.2 起 mss.mss() 已弃用，
+        # 两处各写一份最容易出现「一处理了另一处又退回去」。
+        from src.capture import new_session
 
-        with mss.mss() as sct:
+        with new_session() as sct:
             mon = sct.monitors[0]
             return (
                 int(mon["left"]),
@@ -840,10 +845,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def default_out_path() -> Path:
+    """默认输出路径：桌面（跟随 OneDrive / XDG 重定向），没有就退回主目录。"""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    desktop = Path.home() / "Desktop"
-    base = desktop if desktop.is_dir() else Path.home()
-    return base / f"longshot_{stamp}.pdf"
+    return paths.desktop_dir() / f"longshot_{stamp}.pdf"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -856,8 +860,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         region = resolve_region(args)
         out_path = Path(args.out) if args.out else default_out_path()
-        if out_path.suffix.lower() != ".pdf":
-            out_path = out_path.with_suffix(".pdf")
+        out_path = paths.with_suffix_for(out_path, ".pdf")
+        # 预检：保留设备名（CON 之类会静默写出 0 字节）、结尾空格、上级是文件
+        why = paths.check_target(out_path)
+        if why:
+            raise _InputError(why)
         cfg, ignored = make_config(region, out_path, args)
 
         if args.dry_run:

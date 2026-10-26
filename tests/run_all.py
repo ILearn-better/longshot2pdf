@@ -18,6 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SUITES = [
+    "test_paths.py",        # 路径口径：桌面定位、Windows 保留名、目标预检、后缀规则
     "test_stitch.py",       # 拼接内核（合成帧，零接缝）
     "test_probe.py",        # 滚轮探测
     "test_region.py",       # 截取区域：框选、收口、九宫格对齐、按比例改尺寸

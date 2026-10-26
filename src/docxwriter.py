@@ -39,6 +39,8 @@ from typing import Sequence
 import numpy as np
 from PIL import Image
 
+from . import paths
+
 EMU_PER_PX = 9525          # 914400 / 96
 A4_W_TWIP = 11906          # 210mm
 A4_H_TWIP = 16838          # 297mm
@@ -262,19 +264,29 @@ def write_docx(
     rels.append("</Relationships>")
 
     out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # [Content_Types].xml 放第一个：OPC 规范没强制顺序，
-        # 但有些第三方解析器（含部分 WPS 版本）按顺序找，放第一个最稳。
-        zf.writestr("[Content_Types].xml", _CONTENT_TYPES)
-        zf.writestr("_rels/.rels", _ROOT_RELS)
-        zf.writestr("docProps/core.xml", _core_xml(title))
-        zf.writestr("docProps/app.xml", _APP)
-        zf.writestr("word/document.xml", document)
-        zf.writestr("word/_rels/document.xml.rels", "".join(rels))
-        zf.writestr("word/styles.xml", _STYLES)
-        for i, image in enumerate(images, start=1):
-            zf.writestr(f"word/media/image{i}.jpeg", _encode_jpeg(image, quality))
+    why = paths.check_target(out_path)
+    if why:
+        raise ValueError(why)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
+
+    try:
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # [Content_Types].xml 放第一个：OPC 规范没强制顺序，
+            # 但有些第三方解析器（含部分 WPS 版本）按顺序找，放第一个最稳。
+            zf.writestr("[Content_Types].xml", _CONTENT_TYPES)
+            zf.writestr("_rels/.rels", _ROOT_RELS)
+            zf.writestr("docProps/core.xml", _core_xml(title))
+            zf.writestr("docProps/app.xml", _APP)
+            zf.writestr("word/document.xml", document)
+            zf.writestr("word/_rels/document.xml.rels", "".join(rels))
+            zf.writestr("word/styles.xml", _STYLES)
+            for i, image in enumerate(images, start=1):
+                zf.writestr(f"word/media/image{i}.jpeg", _encode_jpeg(image, quality))
+    except OSError as exc:
+        raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
     return out_path
 
 

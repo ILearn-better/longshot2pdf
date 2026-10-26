@@ -19,6 +19,8 @@
 需要带 tkinter 的解释器；没有时 run_all.py 会自动跳过。
 """
 
+from __future__ import annotations
+
 import sys
 import time
 import tkinter

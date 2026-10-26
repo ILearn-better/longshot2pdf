@@ -24,7 +24,6 @@ tkinter 给的是**逻辑像素**，mss 给的是**物理像素**。系统缩放
 from __future__ import annotations
 
 import dataclasses
-import os
 import queue
 import sys
 import threading
@@ -39,6 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # 框选相关的实现搬到了 src/regionpick.py：两个面板都要用它，而
 # `python gui.py` 下本模块的名字是 __main__，从别处 import gui 会把界面再跑一遍。
 # 这里保留同名对象，既有的调用与测试（gui.select_region = ...）都不用改。
+from src import paths  # noqa: E402
 from src.regionpick import (  # noqa: E402
     MIN_SELECTION,
     Region,
@@ -70,11 +70,14 @@ def _load_tk():
 
 
 def default_out_path() -> Path:
-    """默认输出到桌面；没有桌面目录（某些精简系统）就退回用户主目录。"""
+    """默认输出到桌面；跟随 OneDrive / XDG 的桌面重定向，没有就退回主目录。
+
+    不能直接写 ``Path.home() / "Desktop"``：OneDrive 备份会把桌面挪到
+    ``~/OneDrive/Desktop``，Linux 中文环境又叫 ``~/桌面`` —— 那样写会悄悄
+    存到主目录，用户按「存桌面」的预期找不到文件。
+    """
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    desktop = Path.home() / "Desktop"
-    base = desktop if desktop.is_dir() else Path.home()
-    return base / f"longshot_{stamp}.pdf"
+    return paths.desktop_dir() / f"longshot_{stamp}.pdf"
 
 
 def build_config(region: Region, out_path: Path, values: dict):
@@ -430,12 +433,19 @@ def main() -> int:
 
         out_text = out_var.get().strip()
         out_path = Path(out_text) if out_text else default_out_path()
-        if out_path.suffix.lower() != ".pdf":
-            out_path = out_path.with_suffix(".pdf")
+        out_path = paths.with_suffix_for(out_path, ".pdf")
+        # 先做不改文件系统的预检（保留设备名 / 结尾空格 / 上级是文件），
+        # 这些情况直接 open() 会静默写出 0 字节或抛出看不懂的 WinError
+        why = paths.check_target(out_path)
+        if why:
+            messagebox.showerror("输出路径不可用", why)
+            return
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            messagebox.showerror("输出路径不可用", f"{out_path.parent}\n{exc}")
+            messagebox.showerror(
+                "输出路径不可用", paths.explain_os_error(exc, out_path)
+            )
             return
         out_var.set(str(out_path))
 
@@ -609,7 +619,7 @@ def main() -> int:
         if not pdf:
             return
         try:
-            os.startfile(str(pdf))  # noqa: S606 - 只用系统默认阅读器打开本地文件
+            paths.open_in_default_app(pdf)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("打不开 PDF", f"{pdf}\n{exc}")
 

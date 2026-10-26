@@ -45,13 +45,12 @@
 
 from __future__ import annotations
 
-import os
 import queue
 import threading
 import time
 from pathlib import Path
 
-from src import regionpick
+from src import paths, regionpick
 from src.regionpick import Region, clamp_region, output_size, snap_region
 from src.shots import (
     DEFAULT_PAGE_RATIO,
@@ -87,9 +86,8 @@ ANCHORS = (
 
 
 def _desktop_dir() -> Path:
-    """默认导出目录：桌面，没有就退回用户主目录。"""
-    desktop = Path.home() / "Desktop"
-    return desktop if desktop.is_dir() else Path.home()
+    """默认导出目录：桌面（跟随 OneDrive / XDG 重定向），没有就退回主目录。"""
+    return paths.desktop_dir()
 
 
 def screen_rect() -> Region:
@@ -945,7 +943,7 @@ def build_panel(
         if not path:
             return
         try:
-            os.startfile(str(path))  # noqa: S606 - 用系统默认程序打开本地文件
+            paths.open_in_default_app(path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("打不开文件", f"{path}\n{exc}")
 

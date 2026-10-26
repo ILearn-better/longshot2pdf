@@ -1,6 +1,11 @@
 # LongShot2PDF 运行依赖
 # 只固定「最低可用版本」而不是钉死小版本：这些都是纯 Python / 预编译轮子，
 # 钉太死反而会和用户的 Python 版本打架。安装：pip install -r requirements.txt
+#
+# 下面这组下限是实跑验证过的（Python 3.11 + mss 10.0 + numpy 1.26.4 +
+# Pillow 10.1 + img2pdf 0.5.1），九套离线测试全绿；更新的组合见 README「实测过的组合」。
+# 注意 img2pdf 0.6.x 内部要求 pillow>=10.1，所以 Pillow 的实际下限是 10.1 而不是 10.0
+# —— 这里仍写 10.0，让 pip 自己在两者间求解，写死反而会挡住旧组合。
 
 mss>=10.0        # 区域截图（BitBlt 后端，单帧 1000x1400 约 5~15ms）
 numpy>=1.26      # 帧缓冲、灰度匹配、整数像素裁切

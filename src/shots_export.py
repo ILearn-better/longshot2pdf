@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
+from . import paths
 from .shots import Layout, Shot, estimate_pages, prepare, render_pages
 
 # 截图像素 → pt（1px@96dpi = 0.75pt）。docxwriter 里 gap 用的是 pt，
@@ -106,41 +107,58 @@ def export_document(
 
     fmt = normalize_format(fmt)
     out_path = Path(out_path)
-    if out_path.suffix.lower().lstrip(".") != fmt:
-        out_path = out_path.with_suffix("." + fmt)
+    # 只替换「像格式」的后缀：报告.v2 保留成 报告.v2.pdf，而不是被吃掉版本号
+    out_path = paths.with_suffix_for(out_path, fmt)
+    why = paths.check_target(out_path)
+    if why:
+        raise ValueError(why)
 
     lay = layout.normalized()
     pages_est = estimate_pages(shots, lay)
 
-    if fmt == "docx":
-        from .docxwriter import write_docx
+    try:
+        if fmt == "docx":
+            from .docxwriter import write_docx
 
-        placed = prepare(shots, lay)
-        write_docx(
-            [p.image for p in placed],
-            out_path,
-            # 段落对齐 = 需求里的「位置对齐」；单图一页时也就是水平居中/左/右
-            align=lay.align,
-            # 只有「每图一页」才插分页符；「连续排列」交给 Word 自然分页
-            page_break_between=(lay.paging == "each"),
-            quality=int(quality),
-            gap_pt=max(0.0, lay.gap_px * _PX_TO_PT),
-            title=title,
-            # 关键：EMU 按**排版尺寸**算，图片像素可以更大 —— 版面不变、清晰度更高
-            sizes_px=[(p.logical_width, p.logical_height) for p in placed],
+            placed = prepare(shots, lay)
+            write_docx(
+                [p.image for p in placed],
+                out_path,
+                # 段落对齐 = 需求里的「位置对齐」；单图一页时也就是水平居中/左/右
+                align=lay.align,
+                # 只有「每图一页」才插分页符；「连续排列」交给 Word 自然分页
+                page_break_between=(lay.paging == "each"),
+                quality=int(quality),
+                gap_pt=max(0.0, lay.gap_px * _PX_TO_PT),
+                title=title,
+                # 关键：EMU 按**排版尺寸**算，图片像素可以更大 —— 版面不变、清晰度更高
+                sizes_px=[(p.logical_width, p.logical_height) for p in placed],
+            )
+            images = len(placed)
+        else:
+            from .pdfwriter import images_to_pdf
+
+            # render_pages 出来的画布已经是「排版尺寸 × 清晰度倍数」，而 img2pdf
+            # 只按宽高比例决定页尺寸，所以物理版面一模一样，只是每英寸像素更多。
+            canvases = render_pages(shots, lay)
+            images_to_pdf(canvases, out_path, quality=int(quality))
+            images = len(shots)
+            pages_est = len(canvases)  # PDF 的页数就是画布数，不用估
+    except OSError as exc:
+        # 写盘失败翻成人话：WinError 206(路径太长) / 183(上级是文件) / 5(只读)…
+        raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
+
+    size_bytes = out_path.stat().st_size
+    if size_bytes == 0:
+        # 唯一的真实来源：Windows 保留设备名（CON 之类）会让 open() 成功但
+        # 字节全进了设备，磁盘上留个 0 字节空壳。这里必须炸，不能报「已导出」。
+        raise RuntimeError(
+            f"文件写出来是 0 字节：{out_path}\n"
+            f"通常是文件名撞上了 Windows 保留设备名（CON / PRN / AUX / NUL / COM1…），"
+            f"换一个文件名再试"
         )
-        images = len(placed)
-    else:
-        from .pdfwriter import images_to_pdf
 
-        # render_pages 出来的画布已经是「排版尺寸 × 清晰度倍数」，而 img2pdf
-        # 只按宽高比例决定页尺寸，所以物理版面一模一样，只是每英寸像素更多。
-        canvases = render_pages(shots, lay)
-        images_to_pdf(canvases, out_path, quality=int(quality))
-        images = len(shots)
-        pages_est = len(canvases)  # PDF 的页数就是画布数，不用估
-
-    size_mb = out_path.stat().st_size / (1024.0 * 1024.0)
+    size_mb = size_bytes / (1024.0 * 1024.0)
     return ExportResult(
         path=out_path, fmt=fmt, images=images, pages=pages_est, size_mb=size_mb
     )

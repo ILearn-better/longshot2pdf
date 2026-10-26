@@ -21,6 +21,8 @@ from typing import Iterable, Sequence
 
 import img2pdf
 
+from . import paths
+
 A4_WIDTH_PT = 595.0  # A4 纵向宽度（pt）
 DEFAULT_PAGE_RATIO = 1.414  # 页高 / 页宽（A4 纵向）
 # PDF 规范（PDF 1.7 附录 C）里 Acrobat 支持的单页最大边长为 14400pt（= 200 英寸）。
@@ -107,7 +109,13 @@ def jpegs_to_pdf(
     checked = _validate_pages(pages)
 
     out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    why = paths.check_target(out_path)
+    if why:
+        raise ValueError(why)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
     page_w, page_h = _fit_page_size(page_w_pt, page_ratio)
 
     # layout_fun 固定成 (宽, 高) 的定点布局：img2pdf 默认会按图片 DPI 算尺寸，
@@ -120,6 +128,8 @@ def jpegs_to_pdf(
                 layout_fun=layout,
                 outputstream=fh,
             )
+    except OSError as exc:
+        raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
     except Exception as exc:  # noqa: BLE001 - 统一转成带页数的可读错误
         raise RuntimeError(
             f"合并 PDF 失败（{len(checked)} 页 → {out_path}）：{type(exc).__name__}: {exc}"
@@ -184,14 +194,22 @@ def images_to_pdf(
         raise ValueError("没有可输出的页，无法生成 PDF")
 
     out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    why = paths.check_target(out_path)
+    if why:
+        raise ValueError(why)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
     tmp_dir = Path(tempfile.mkdtemp(prefix="longshot_pages_"))
     try:
-        paths = []
+        # 局部变量不能叫 paths：会和上面 `from . import paths` 撞名，
+        # 一旦遮蔽，下面 except 里的 explain_os_error 就变成「list 没有这个属性」。
+        page_files = []
         for i, img in enumerate(images, start=1):
             p = tmp_dir / f"{i:04d}.jpg"
             Image.fromarray(img).save(p, "JPEG", quality=int(quality), subsampling=0)
-            paths.append(p)
+            page_files.append(p)
 
         def layout(imgwidthpx, imgheightpx, ndpi):
             # img2pdf 的 layout_fun 收 (宽px, 高px, (xdpi, ydpi))，必须返回四个值：
@@ -214,11 +232,15 @@ def images_to_pdf(
         try:
             with open(out_path, "wb") as fh:
                 img2pdf.convert(
-                    [str(p) for p in paths], layout_fun=layout, outputstream=fh
+                    [str(p) for p in page_files],
+                    layout_fun=layout,
+                    outputstream=fh,
                 )
+        except OSError as exc:
+            raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
-                f"合并 PDF 失败（{len(paths)} 页 → {out_path}）："
+                f"合并 PDF 失败（{len(page_files)} 页 → {out_path}）："
                 f"{type(exc).__name__}: {exc}"
             ) from exc
     finally:
