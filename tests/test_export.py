@@ -258,6 +258,40 @@ def case_guards(tmp: Path) -> None:
     assert res.path.suffix == ".docx", res.path
 
 
+def case_page_count_without_pypdf(tmp: Path) -> None:
+    """没有 pypdf 时，pdf_page_count 走「数 /Type /Page」的兜底路径。
+
+    打包成 exe 时 pypdf 是被排除掉的（省 1MB），那条路径在源码环境里
+    平时永远走不到 —— 不专门测就等于没测过。这里把 sys.modules['pypdf']
+    置成 None，让 `from pypdf import PdfReader` 抛 ImportError，从而强制走兜底。
+    """
+    print("\n[7] 没有 pypdf 时仍能数出页数（打包版的路径）")
+    from src import pdfwriter
+
+    shots = sample_shots()
+    res = export_document(shots, Layout(paging="each"), tmp / "fallback.pdf", "pdf")
+    truth = res.pages
+
+    with_pypdf = pdfwriter.pdf_page_count(res.path)
+    assert with_pypdf == truth, f"pypdf 读到 {with_pypdf} 页，期望 {truth}"
+
+    saved = sys.modules.get("pypdf", "缺失")
+    sys.modules["pypdf"] = None          # 让 import pypdf 直接失败
+    try:
+        without = pdfwriter.pdf_page_count(res.path)
+    finally:
+        if saved == "缺失":
+            sys.modules.pop("pypdf", None)
+        else:
+            sys.modules["pypdf"] = saved
+
+    assert without == truth, f"兜底数页得到 {without}，期望 {truth}"
+    print(f"      pypdf={with_pypdf} 页，兜底={without} 页，一致")
+
+    # 不存在的文件仍然返回 -1，而不是抛异常
+    assert pdfwriter.pdf_page_count(tmp / "没有这个文件.pdf") == -1
+
+
 def main() -> int:
     print("=" * 64)
     print("连续截图整合 · 导出 Word / PDF")
@@ -270,6 +304,7 @@ def main() -> int:
         case_pdf(tmp)
         case_scan_export(tmp)
         case_guards(tmp)
+        case_page_count_without_pypdf(tmp)
     except AssertionError as exc:
         print(f"\n[FAIL] {exc}")
         return 1

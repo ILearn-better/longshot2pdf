@@ -175,6 +175,42 @@ python run.py --doctor                            # 环境体检
 启动器专用参数：`--venv` 强制重建 `.venv`、`--no-install` 只看不装、
 `--no-switch` 禁止自动换解释器、`--help` 查看全部。
 
+## 打包成 exe（对方不用装 Python）
+
+```bash
+python tools/build_exe.py                              # 25.3 MB，最稳
+python tools/build_exe.py --upx <upx所在目录>            # 14.7 MB，最小
+```
+
+产物是单个 `dist/LongShot2PDF.exe`。**双击 = 界面**（背后不会吊着一个黑窗口），
+**带参数 = 命令行**：
+
+```bash
+LongShot2PDF.exe --select --out 长图.pdf
+LongShot2PDF.exe --doctor       # 环境体检：依赖 / 界面 / 截图 / 导出目录
+LongShot2PDF.exe --selftest     # 离线自测：JPEG → PDF 全链路
+```
+
+体积是怎么一步步降下来的（都是实测，不是估计）：
+
+| 阶段 | 体积 |
+|---|---|
+| `--optimize 2` 剥掉全部文档字符串 + 排除第一批用不到的模块 | 25.25 MB |
+| 加 UPX 再压一遍二进制 | 17.40 MB |
+| 再排 `_hashlib`（带出 1.6 MB 的 libcrypto）、`numpy.random`、`PIL._webp`，tcl/tk 的演示与时区数据不进包 | **14.74 MB** |
+
+**为什么不能再小了**：numpy 的 `libscipy_openblas64_*.dll` 一个文件就 36.6 MB
+（压完 7.8 MB），而 `numpy/_core/_multiarray_umath.pyd` 的导入表直接链着它 ——
+删掉它 numpy 连 `import` 都过不去。本项目确实用 `np.fft` 做互相关，换不掉。
+
+打包脚本顺手做了几件容易漏的事：conda 的 tcl/tk 与 ffi.dll 不在标准位置（不手动塞进去，
+exe 能启动但一点「打开界面」就 DLL load failed）；冻结后 `sys.frozen` 为真，
+启动器跳过找解释器/装依赖那段逻辑（否则它会把 exe 自己当解释器去执行 `-c`）；
+输出重定向到管道时统一转 UTF-8，免得日志变乱码。
+
+UPX 的代价：个别杀软会对压缩过的二进制误报，发版前在一台干净机器上双击确认一次；
+首次启动要多花一两秒解压到临时目录。
+
 ## 项目结构
 
 ```
@@ -199,7 +235,8 @@ longshot2pdf/
 ├── shots_gui.py         「连续截图整合」面板（F9 轮询、列表、参数联动、导出状态）
 ├── cli.py               命令行入口
 ├── tools/
-│   └── make_demo.py     生成 demo/ 下的示例文档（不需要界面）
+│   ├── make_demo.py     生成 demo/ 下的示例文档（不需要界面）
+│   └── build_exe.py     打包成单文件 exe（生成图标/版本资源，可接 UPX）
 └── tests/
     ├── mock_frames.py      合成文档 / 虚拟屏幕（离线测试地基）
     ├── test_paths.py       路径口径：桌面、保留名、目标预检、错误转译、后缀

@@ -9,6 +9,9 @@ dist/
 .eggs/
 pip-wheel-metadata/
 
+# 打包时生成的图标 / 版本资源（tools/build_exe.py 会重建）
+packaging/
+
 # ---------- 虚拟环境 ----------
 .venv/
 venv/

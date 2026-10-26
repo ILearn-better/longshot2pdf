@@ -50,6 +50,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 MIN_PY = (3, 9)
+
+# 是否在 PyInstaller 打出来的单文件 exe 里跑。
+# 这一位决定了启动器要不要做「找解释器 / 建 venv / 装依赖」——
+# 打包之后这些都已经是既成事实，再去找解释器只会去找一个不存在的 Python，
+# 甚至把 exe 自己当成解释器去 `exe -c "..."` 而拿回一堆废输出。
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_NAME = "LongShot2PDF"
 DEPS = (
     ("mss", "mss"),
     ("numpy", "numpy"),
@@ -435,6 +442,141 @@ def relaunch(py: str | Path) -> int:
 # ---------------------------------------------------------------- 启动
 
 
+# ---------------------------------------------------------------- 打包版入口
+
+
+def tune_stdio() -> None:
+    """输出被重定向到管道/文件时，统一改成 UTF-8。
+
+    不这么做的话：中文 Windows 上 `LongShot2PDF.exe --doctor > log.txt` 写出来的是
+    cp936，别人（或 CI）按 UTF-8 读就是一串问号。接在真控制台上时不动它 ——
+    那时 Python 走的是宽字符 API，本来就没有编码问题。
+
+    errors="replace" 是为了「宁可显示成 ? 也别抛 UnicodeEncodeError」：
+    导出路径里可能带用户自己敲的怪字符，一个编码错误不该让整条命令失败。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - 某些宿主把 stdout 换成了非 TextIOWrapper
+            pass
+
+
+def show_console(show: bool) -> None:
+    """显示 / 隐藏本进程的控制台窗口。
+
+    只在打包版 + Windows 下有意义，源码运行时是空操作。
+
+    为什么需要这一手：GUI 和 CLI 共用一个 exe。
+    - 用 windowed 子系统打包 → CLI 模式彻底拿不到 stdout，脚本里调用等于瞎子；
+    - 用 console 子系统打包 → 双击开界面时背后永远吊着一个黑窗口。
+    两个都不好，所以取 console 子系统，启动时自己决定要不要把它藏起来：
+    GUI 模式藏起来，CLI 模式留着，GUI 崩了再拉回来显示 traceback。
+    """
+    if os.name != "nt" or not FROZEN:
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 1 if show else 0)
+    except Exception:  # noqa: BLE001 - 藏不起来也不影响功能
+        pass
+
+
+def frozen_doctor() -> int:
+    """打包版的环境体检：写死的东西不用查，只查和环境有关的部分。"""
+    print(f"{APP_NAME} 环境体检（打包版）")
+    print("=" * 60)
+    print(f"程序 {sys.executable}")
+    try:
+        import src
+
+        print(f"版本 {src.__version__}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    print()
+    print("内置依赖")
+    for mod, pkg in DEPS:
+        try:
+            m = __import__(mod)
+            ver = getattr(m, "__version__", "?")
+        except Exception as exc:  # noqa: BLE001
+            ver = f"缺失（{type(exc).__name__}）"
+        print(f"  {pkg:<10} {ver}")
+
+    print()
+    ok = True
+    tk_ok, tk_msg = tk_can_open()
+    print(f"{'[OK]' if tk_ok else '[!!]'} 图形界面  {tk_msg}")
+    ok = ok and tk_ok
+
+    sc_ok, sc_msg = screen_status()
+    print(f"{'[OK]' if sc_ok else '[!!]'} 截图能力  {sc_msg}")
+    ok = ok and sc_ok
+
+    # 导出目录可写：只看不写（真要写会在用户桌面留垃圾），
+    # 用 os.access 判断已经足够，失败时再让用户自己换路径。
+    try:
+        from src import paths as _paths
+
+        target = _paths.desktop_dir()
+        writable = os.access(str(target), os.W_OK)
+        print(f"{'[OK]' if writable else '[!!]'} 导出目录  {target}")
+        ok = ok and writable
+    except Exception as exc:  # noqa: BLE001
+        print(f"[!!] 导出目录  {type(exc).__name__}: {exc}")
+        ok = False
+
+    print("=" * 60)
+    if ok:
+        print("一切正常：双击即可开界面，或带参数当命令行用（--help 看用法）。")
+        return EXIT_OK
+    print("有项目没通过，见上面的 [!!] 行。")
+    print(f"界面之外想验证整条链路，可以跑 {APP_NAME}.exe --selftest")
+    return EXIT_ENV
+
+
+def frozen_main(argv: list[str]) -> int:
+    """打包版的总入口：不找解释器、不装依赖，只分发。"""
+    import traceback
+
+    tune_stdio()
+
+    if argv[:1] in (["--doctor"], ["-d"]):
+        return frozen_doctor()
+
+    # `--gui` 是个显式开关：不带参数本来就是界面，带上只是把这个意图写明，
+    # 两者都接受，免得用户记两套规则。
+    want_gui = not argv
+    if argv[:1] == ["--gui"]:
+        argv = argv[1:]
+        want_gui = not argv
+
+    if not want_gui:
+        import cli
+
+        return cli.main(argv)
+
+    show_console(False)
+    try:
+        import gui
+
+        return gui.main()
+    except Exception:  # noqa: BLE001 - 界面起不来时，把 traceback 还给人看
+        show_console(True)
+        traceback.print_exc()
+        print()
+        print("界面没起来。把上面的堆栈发出来即可定位；")
+        print(f"也可以先跑 {APP_NAME}.exe --doctor 看看环境。")
+        return EXIT_ENV
+    finally:
+        show_console(True)
+
+
 def launch_gui() -> int:
     tk_ok, tk_msg = tk_can_open()
     if not tk_ok:
@@ -457,6 +599,12 @@ def launch_gui() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    # 打包版：解释器/依赖都是既成事实，上面那套探测逻辑不仅没用，还有害
+    # （会把 exe 自己当解释器去执行 `-c`，拿回一堆解析不了的输出）。
+    if FROZEN:
+        return frozen_main(argv)
+
     switched = bool(os.environ.get(_SWITCH_FLAG))
 
     # ---- 显式建 venv ----

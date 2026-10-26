@@ -294,6 +294,15 @@ class _InputError(Exception):
     """输入类问题 → 退出码 2。用异常而不是直接 sys.exit，方便上层统一收尾。"""
 
 
+class _SkipMock(Exception):
+    """自测里「要用假屏幕但仓库里没有 tests/」的情形，跳过而不是判失败。
+
+    打包成 exe 之后 tests/ 不再随包走，B/C 两段注定跑不起来 ——
+    但那不是故障：A 段已经把「JPEG → PDF 零重编码」这条链路验过了。
+    记成失败会让打包版的 --selftest 永远红着，反而没人看。
+    """
+
+
 # --------------------------------------------------------------------- 配置构造
 
 
@@ -498,11 +507,11 @@ def _load_mock_frames():
 
     path = PROJECT_ROOT / "tests" / "mock_frames.py"
     if not path.exists():
-        raise RuntimeError(f"找不到 mock 数据模块：{path}")
+        raise _SkipMock(f"没有 mock 数据模块（{path}），B/C 两段跳过")
     name = "_ls2pdf_mock_frames"
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"无法加载 {path}")
+        raise _SkipMock(f"无法加载 mock 数据模块（{path}），B/C 两段跳过")
     module = importlib.util.module_from_spec(spec)
     # 必须先登记到 sys.modules：模块里的 @dataclass 需要在自己模块的命名空间里
     # 找到 sys.modules[cls.__module__]，否则会抛 'NoneType' object has no attribute '__dict__'
@@ -722,6 +731,8 @@ def selftest() -> int:
             # 覆盖率：拼接总行数应等于文档高度，说明首行到末行一行没丢
             if rows < doc.shape[0] - view_h:
                 failures.append(f"拼接覆盖不足：rows={rows}，文档高 {doc.shape[0]}")
+    except _SkipMock as exc:
+        print(f"    跳过：{exc}")
     except Exception as exc:  # noqa: BLE001
         failures.append(f"端到端异常：{type(exc).__name__}: {exc}")
 
@@ -757,6 +768,8 @@ def selftest() -> int:
             print(f"    report() 退出码 = {code}（期望 {EXIT_INTERRUPTED}）")
             if code != EXIT_INTERRUPTED:
                 failures.append(f"中断退出码 {code}，期望 {EXIT_INTERRUPTED}")
+    except _SkipMock as exc:
+        print(f"    跳过：{exc}")
     except Exception as exc:  # noqa: BLE001
         failures.append(f"中断语义异常：{type(exc).__name__}: {exc}")
 

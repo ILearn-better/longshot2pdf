@@ -16,6 +16,7 @@ img2pdf 把 JPEG 的原始码流直接塞进 PDF 作为图像流（DCTDecode 过
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -28,6 +29,10 @@ DEFAULT_PAGE_RATIO = 1.414  # 页高 / 页宽（A4 纵向）
 # PDF 规范（PDF 1.7 附录 C）里 Acrobat 支持的单页最大边长为 14400pt（= 200 英寸）。
 # 超过它很多阅读器会直接拒绝打开或渲染成空白，所以必须主动收口。
 PDF_MAX_PAGE_PT = 14400.0
+
+# 数页数用的兜底正则：`/Type /Page`，但不能是 `/Type /Pages`（那是页树根）。
+# 见 pdf_page_count 的说明。
+_PAGE_OBJ_RE = re.compile(rb"/Type\s*/Page[^s]")
 
 
 def _validate_pages(pages: Sequence[Path]) -> list[Path]:
@@ -140,18 +145,37 @@ def jpegs_to_pdf(
 def pdf_page_count(path: Path) -> int:
     """读回 PDF 的页数，供自测断言用。
 
-    返回 -1 表示「读不到」—— 两种情况都算：pypdf 未安装（本模块的功能不依赖它，
-    所以不硬 import），或者文件损坏/不存在。返回 -1 而不是抛异常，
-    是为了让自测代码里 `assert pdf_page_count(p) == 3` 这种写法能直接表达失败。
+    两条路，按「准 → 快」的顺序退化：
+
+    1. 有 pypdf 就让它解析（最权威）；
+    2. 没有 pypdf（打包成 exe 时它被排除掉了，省 1MB 体积）就直接数
+       ``/Type /Page``。img2pdf 写的是**未压缩的对象**，页字典明文可见，
+       数出来的 3 就是 3。
+
+    第 2 条对「别家生成的 PDF」不一定成立：不少工具会把对象压进
+    object stream，那时一个 ``/Type /Page`` 都扫不到。所以它只用于
+    自测（本模块自己写出来的文件），不要拿去验第三方 PDF。
+
+    返回 -1 表示「读不到」—— 文件损坏/不存在，或者两条路都没成。
+    返回 -1 而不是抛异常，是为了让自测里 `pdf_page_count(p) == 3`
+    这种写法能直接表达失败。
     """
     try:
         from pypdf import PdfReader
     except Exception:  # noqa: BLE001 - 没装 pypdf 不算错误
-        return -1
+        pass
+    else:
+        try:
+            return len(PdfReader(str(path)).pages)
+        except Exception:  # noqa: BLE001 - 文件损坏/加密/不存在
+            return -1
+
     try:
-        return len(PdfReader(str(path)).pages)
-    except Exception:  # noqa: BLE001 - 文件损坏/加密/不存在
+        data = Path(path).read_bytes()
+    except OSError:
         return -1
+    # [^s] 把 /Type /Pages 挡在外面：那是页树根，不是页
+    return len(_PAGE_OBJ_RE.findall(data)) or -1
 
 
 def pages_total_size(pages: Iterable[Path]) -> int:
