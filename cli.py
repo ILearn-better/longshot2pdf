@@ -773,6 +773,36 @@ def selftest() -> int:
     except Exception as exc:  # noqa: BLE001
         failures.append(f"中断语义异常：{type(exc).__name__}: {exc}")
 
+    # ---------- D. 按页码合并 ----------
+    print("\n[D] PDF 合并：19 页 + 40 页取 1-20,22-40 → 58 页")
+    try:
+        from src import pdfmerge
+
+        def build(name: str, pages: int, shade: int):
+            files = []
+            for i in range(pages):
+                arr = np.full((60, 48, 3), shade, dtype=np.uint8)
+                arr[: 3 + i % 5, :4] = 245
+                p = workdir / f"{name}_{i + 1:03d}.jpg"
+                Image.fromarray(arr).save(p, quality=88, subsampling=0)
+                files.append(p)
+            return pdfwriter.jpegs_to_pdf(files, workdir / f"{name}.pdf")
+
+        left = build("mrg_a", 19, 210)
+        right = build("mrg_b", 40, 60)
+        merged = pdfmerge.merge([(left, "1-19"), (right, "1-20,22-40")], workdir / "mrg.pdf")
+        # 读回页数必须走 pypdf（打包时它是常驻依赖）；没有它合并功能本身也跑不起来
+        count = pdfwriter.pdf_page_count(merged.out_path)
+        expect = 19 + 39
+        print(f"    生成 {merged.out_path.name}，读回 {count} 页（期望 {expect}）")
+        print(f"    单位置检查：{pdfmerge.describe_pages(pdfmerge.parse_pages('1-20,22-40', 40))}")
+        if merged.pages != expect or count != expect:
+            failures.append(f"合并页数不符：报告 {merged.pages}，读回 {count}，期望 {expect}")
+        if (workdir / "mrg.pdf").stat().st_size == 0:
+            failures.append("合并产物是 0 字节")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"合并异常：{type(exc).__name__}: {exc}")
+
     # ---------- 结论 ----------
     print("\n== 自测结论 ==")
     if failures:
@@ -800,6 +830,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py --select --manual              # 你自己滚，它只负责拼\n"
             "  python cli.py --fullscreen --max-pages 300 --quiet\n"
             "  python cli.py --dry-run --region 0,0,800,600 --out /tmp/x.pdf\n"
+            "  python cli.py --merge 第一段.pdf=1-19 --merge 第二段.pdf=1-30 -o 全文.pdf\n"
             "  python cli.py --selftest\n"
             "\n退出码：0 成功 / 2 输入问题或不可滚动 / 3 运行异常 / 130 中断但已出半成品"
         ),
@@ -813,7 +844,7 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--fullscreen", action="store_true",
                      help="截取整个虚拟桌面（含副屏）")
 
-    parser.add_argument("--out", type=Path, metavar="PDF",
+    parser.add_argument("--out", "-o", type=Path, metavar="PDF",
                         help="输出 PDF 路径（默认放到桌面 longshot_时间戳.pdf）")
     parser.add_argument("--overlap", type=_type_overlap, default=DEFAULTS["overlap"],
                         metavar="R", help="相邻帧重叠比例，%.2f~%.2f（默认 0.15）" % (MIN_OVERLAP, MAX_OVERLAP))
@@ -850,6 +881,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="仅 --manual：多少秒没有滚动就自动收尾，0 = 一直等"
                              "（默认 60）")
     parser.add_argument("--quiet", action="store_true", help="不打印进度行")
+    parser.add_argument("--merge", action="append", metavar="PDF[=页码]",
+                        help="按页码范围合并多个 PDF（可重复给多次）。"
+                             "如 --merge a.pdf=1-19 --merge \"b.pdf=1-20,22-40\"，"
+                             "省略 =页码 表示整本。只合并、不截图")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="只打印将要做什么（区域/估算页数/输出路径），不截图")
     parser.add_argument("--selftest", action="store_true",
@@ -863,12 +898,89 @@ def default_out_path() -> Path:
     return paths.desktop_dir() / f"longshot_{stamp}.pdf"
 
 
+def default_merge_path() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return paths.desktop_dir() / f"merged_{stamp}.pdf"
+
+
+def run_merge(args) -> int:
+    """--merge 模式：只合并 PDF，不碰屏幕。
+
+    断点续存的收尾动作就在这里：中断后得到 长图.pdf、长图(1).pdf、长图(2).pdf，
+    确认好每段要的范围，一条命令接成完整的一份。
+    """
+    from src import pdfmerge
+
+    try:
+        items = [pdfmerge.parse_spec(text) for text in args.merge]
+    except pdfmerge.MergeError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    out_path = Path(args.out) if args.out else default_merge_path()
+    out_path = paths.with_suffix_for(out_path, ".pdf")
+    why = paths.check_target(out_path)
+    if why:
+        print(f"错误：{why}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+
+    if args.dry_run:
+        print(f"将合并 {len(items)} 个来源  →  {out_path}（同名会自动加 (1)）")
+        total_pages = 0
+        for item in items:
+            count = pdfmerge.read_page_count(item.path)
+            if count < 0:
+                print(
+                    f"  {item.path}：读不出页数（文件不存在、损坏或是加密 PDF）",
+                    file=sys.stderr,
+                )
+                return EXIT_BAD_INPUT
+            try:
+                picked = pdfmerge.parse_pages(item.ranges, count)
+            except pdfmerge.MergeError as exc:
+                print(f"  {item.path.name}：{exc}", file=sys.stderr)
+                return EXIT_BAD_INPUT
+            total_pages += len(picked)
+            print(
+                f"  {item.path.name}  共 {count} 页，取 "
+                f"{pdfmerge.describe_pages(picked)}（{len(picked)} 页）"
+            )
+        print(f"合计 {total_pages} 页")
+        return EXIT_OK
+
+    print(f"合并 {len(items)} 个来源  →  {out_path}")
+
+    def on_progress(done: int, total: int, note: str) -> None:
+        if not args.quiet:
+            print(f"  [{done}/{total}] {note}")
+
+    try:
+        result = pdfmerge.merge(items, out_path, on_progress=on_progress)
+    except pdfmerge.MergeError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    except RuntimeError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_RUNTIME_ERROR
+    except Exception as exc:  # noqa: BLE001
+        print(f"运行异常：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_RUNTIME_ERROR
+
+    print(result.summary())
+    # 同名时会自动改成 名字(1).pdf，所以必须把**实际**路径说出来
+    print(f"实际写出：{result.out_path}")
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.selftest:
         return selftest()
+
+    if args.merge:
+        return run_merge(args)
 
     try:
         region = resolve_region(args)

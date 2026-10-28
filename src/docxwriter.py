@@ -192,6 +192,7 @@ def write_docx(
     gap_pt: float = 6.0,
     title: str = "连续截图整合",
     sizes_px: Sequence[tuple[int, int]] | None = None,
+    unique: bool = True,
 ) -> Path:
     """把一组 RGB 图片写成 docx，返回输出路径。
 
@@ -271,6 +272,9 @@ def write_docx(
         out_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
+    if unique:
+        # 与 PDF 侧同一条规矩：同名不覆盖，改成 名字(1).docx
+        out_path = paths.unique_path(out_path)
 
     try:
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:

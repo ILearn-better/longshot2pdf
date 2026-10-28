@@ -107,6 +107,361 @@ def _pipeline_has(param: str) -> bool:
         return False
 
 
+# --------------------------------------------------------------------- 合并面板
+
+
+def build_merge_tab(parent, *, tk, ttk, filedialog, messagebox, root) -> dict:
+    """「PDF 合并」标签页：每张 PDF 一行，右边一个填页码范围的输入框。
+
+    为什么单独一个标签页而不是塞进采集页
+    ------------------------------------
+    采集页在采集期间要「整块消失」（面板本身会被截进画面），而合并是采集
+    **之后**的事，还得让用户一边看结果一边改页码。两件事的界面生命周期完全
+    相反，挤在一起只会互相干扰。
+
+    为什么是「每行一个输入框」而不是「选中一行再在下面填」
+    ------------------------------------------------------
+    需求原话就是「右侧提供输入框用于填写该 PDF 需要参与合并的页码范围」。
+    一行一框的好处是一屏就能看全所有范围，不用来回点选；坏处是占地方，
+    所以清单区做成可滚动的。
+
+    返回句柄：``add_file(path)`` 给采集完成时自动登记结果用。
+    """
+    from src import pdfmerge
+
+    outer = ttk.Frame(parent)
+    outer.pack(fill="both", expand=True)
+
+    ttk.Label(outer, text="PDF 合并（按页码范围）", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(
+        outer,
+        text=(
+            "从上到下就是拼接顺序。右边填这个 PDF 要哪些页：留空 = 整本，"
+            "1-19 = 前 19 页，1-20,22-40 = 跳过第 21 页。"
+            "同一份文件想要多段，写在一个框里就行。"
+        ),
+        foreground="#666666",
+        wraplength=600,
+        justify="left",
+    ).pack(anchor="w", pady=(2, 8))
+
+    box = ttk.LabelFrame(outer, text=" 合并清单 ", padding=(8, 6))
+    box.pack(fill="both", expand=True)
+
+    # 表头：说明每一列是什么，也顺便固定列宽，免得输入框随文件名长短跳动
+    head = ttk.Frame(box)
+    head.pack(fill="x")
+    ttk.Label(head, text="#", width=3, anchor="e", foreground="#888888").grid(row=0, column=0)
+    ttk.Label(head, text="文件", anchor="w", foreground="#888888").grid(
+        row=0, column=1, sticky="ew", padx=(6, 0)
+    )
+    ttk.Label(head, text="页数", width=8, anchor="e", foreground="#888888").grid(
+        row=0, column=2, padx=(6, 0)
+    )
+    ttk.Label(head, text="页码范围", width=18, anchor="w", foreground="#888888").grid(
+        row=0, column=3, padx=(8, 0)
+    )
+    ttk.Label(head, text="", width=11).grid(row=0, column=4)
+    head.columnconfigure(1, weight=1)
+
+    # ---- 可滚动清单 ----
+    wrap = ttk.Frame(box)
+    wrap.pack(fill="both", expand=True, pady=(4, 0))
+    canvas = tk.Canvas(wrap, highlightthickness=0, height=210)
+    scroll = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+    inner = ttk.Frame(canvas)
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scroll.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scroll.pack(side="right", fill="y")
+
+    def _sync_scroll(_event=None) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _sync_width(event) -> None:
+        canvas.itemconfigure(window, width=event.width)
+
+    inner.bind("<Configure>", _sync_scroll)
+    canvas.bind("<Configure>", _sync_width)
+    # 滚轮只在鼠标位于清单上方时接管，离开就解绑 —— 全局绑死会抢走
+    # 其它输入框/下拉框的滚轮行为（tk 的经典坑）。
+    def _on_wheel(event) -> None:
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+    canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+    empty_var = tk.StringVar(value="清单还是空的：截完一张会自动出现在这里，也可以点「添加 PDF…」")
+    empty_lbl = ttk.Label(inner, textvariable=empty_var, foreground="#999999")
+
+    rows: list[dict] = []
+    busy = {"run": False}
+    last_result: dict = {"path": None}
+
+    # ---- 行操作 ----
+    def _reindex() -> None:
+        for i, row in enumerate(rows, start=1):
+            row["idx"].configure(text=str(i))
+
+    def _relayout() -> None:
+        for row in rows:
+            row["frame"].pack_forget()
+        for row in rows:
+            row["frame"].pack(fill="x", pady=1)
+        if rows:
+            empty_lbl.pack_forget()
+        else:
+            empty_lbl.pack(anchor="w", pady=8)
+        _reindex()
+        _validate_and_show()
+
+    def _move(row: dict, delta: int) -> None:
+        if busy["run"]:
+            return
+        try:
+            at = rows.index(row)
+        except ValueError:
+            return
+        to = at + delta
+        if not (0 <= to < len(rows)):
+            return
+        rows[at], rows[to] = rows[to], rows[at]
+        _relayout()
+
+    def _remove(row: dict) -> None:
+        if busy["run"]:
+            return
+        if row in rows:
+            rows.remove(row)
+        row["frame"].destroy()
+        _relayout()
+
+    def _first_error() -> str | None:
+        """校验所有行，返回第一条问题（None = 全部可用）。"""
+        for i, row in enumerate(rows, start=1):
+            if row["count"] <= 0:
+                return f"第 {i} 行「{row['path'].name}」读不出页数（文件损坏或加密）"
+            text = row["ranges"].get().strip()
+            try:
+                pdfmerge.parse_pages(text, row["count"])
+            except pdfmerge.MergeError as exc:
+                return f"第 {i} 行「{row['path'].name}」：{exc}"
+        return None
+
+    def _validate_and_show() -> None:
+        if busy["run"]:
+            return
+        err = _first_error()
+        if err:
+            status_var.set("✗ " + err)
+            btn_merge.state(["disabled"])
+        else:
+            status_var.set(
+                f"待合并 {len(rows)} 个来源 · 合计 "
+                f"{sum(len(pdfmerge.parse_pages(r['ranges'].get(), r['count'])) for r in rows)} 页"
+                if rows
+                else "清单为空"
+            )
+            btn_merge.state(["!disabled"] if rows else ["disabled"])
+
+    def add_file(path, ranges: str = "") -> None:
+        """把一份 PDF 加进清单（采集完成后自动调用）。"""
+        p = Path(path)
+        count = pdfmerge.read_page_count(p)
+        frame = ttk.Frame(inner)
+        idx = ttk.Label(frame, width=3, anchor="e")
+        shown = p.name if len(p.name) <= 34 else p.name[:31] + "…"
+        name = ttk.Label(frame, text=shown, anchor="w")
+        pages = ttk.Label(
+            frame, text=(f"{count} 页" if count > 0 else "? 页"), width=8, anchor="e"
+        )
+        var = tk.StringVar(value=str(ranges or ""))
+        entry = ttk.Entry(frame, textvariable=var, width=18)
+        up = ttk.Button(frame, text="↑", width=3)
+        down = ttk.Button(frame, text="↓", width=3)
+        kill = ttk.Button(frame, text="✕", width=3)
+
+        idx.grid(row=0, column=0)
+        name.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        pages.grid(row=0, column=2, padx=(6, 0))
+        entry.grid(row=0, column=3, padx=(8, 0))
+        up.grid(row=0, column=4, padx=(6, 0))
+        down.grid(row=0, column=5)
+        kill.grid(row=0, column=6)
+        frame.columnconfigure(1, weight=1)
+
+        row = {
+            "path": p, "count": count, "frame": frame, "ranges": var,
+            "idx": idx, "entry": entry, "pages": pages,
+        }
+        up.configure(command=lambda r=row: _move(r, -1))
+        down.configure(command=lambda r=row: _move(r, 1))
+        kill.configure(command=lambda r=row: _remove(r))
+        # 鼠标悬停时在状态行显示完整路径：文件名被截断过，得能核对是哪一个
+        name.bind("<Enter>", lambda _e, q=p: hint_var.set(str(q)))
+        name.bind("<Leave>", lambda _e: hint_var.set(""))
+        for widget in (entry, pages):
+            widget.bind("<Enter>", lambda _e, q=p: hint_var.set(str(q)))
+            widget.bind("<Leave>", lambda _e: hint_var.set(""))
+        var.trace_add("write", lambda *_a: _validate_and_show())
+
+        rows.append(row)
+        _relayout()
+        canvas.after_idle(_sync_scroll)
+
+    # ---- 按钮 ----
+    bar = ttk.Frame(outer)
+    bar.pack(fill="x", pady=(10, 0))
+    btn_add = ttk.Button(bar, text="添加 PDF…")
+    btn_add.pack(side="left")
+    btn_clear = ttk.Button(bar, text="清空")
+    btn_clear.pack(side="left", padx=(8, 0))
+    btn_open = ttk.Button(bar, text="打开结果", state="disabled")
+    btn_open.pack(side="right")
+    btn_merge = ttk.Button(bar, text="合并并保存…", style="Start.TButton")
+    btn_merge.pack(side="right", padx=(0, 8))
+
+    status_var = tk.StringVar(value="清单为空")
+    hint_var = tk.StringVar(value="")
+    ttk.Label(outer, textvariable=status_var, wraplength=600, justify="left").pack(
+        anchor="w", pady=(10, 0)
+    )
+    ttk.Label(outer, textvariable=hint_var, foreground="#888888").pack(anchor="w")
+
+    def on_add() -> None:
+        if busy["run"]:
+            return
+        picked = filedialog.askopenfilenames(
+            title="选择要合并的 PDF（可多选）",
+            filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+        )
+        if not picked:
+            return
+        for item in picked:
+            add_file(item)
+
+    def on_clear() -> None:
+        if busy["run"]:
+            return
+        for row in list(rows):
+            row["frame"].destroy()
+        rows.clear()
+        _relayout()
+
+    def on_merge() -> None:
+        if busy["run"]:
+            return
+        if not rows:
+            messagebox.showinfo("清单是空的", "先截几张图，或点「添加 PDF…」选几份。")
+            return
+        err = _first_error()
+        if err:
+            messagebox.showerror("页码范围有问题", err)
+            return
+
+        first = rows[0]["path"]
+        out = filedialog.asksaveasfilename(
+            title="合并结果保存到…",
+            defaultextension=".pdf",
+            filetypes=[("PDF 文件", "*.pdf")],
+            initialdir=str(first.parent),
+            initialfile=f"合并_{datetime.now():%Y%m%d_%H%M%S}.pdf",
+        )
+        if not out:
+            return
+
+        items = [(row["path"], row["ranges"].get().strip()) for row in rows]
+        busy["run"] = True
+        btn_merge.state(["disabled"])
+        btn_add.state(["disabled"])
+        btn_clear.state(["disabled"])
+        status_var.set("正在合并…")
+
+        q: queue.Queue = queue.Queue()
+
+        def work() -> None:
+            try:
+                q.put(("progress", f"准备合并 {len(items)} 个来源…"))
+
+                def prog(done: int, total: int, note: str) -> None:
+                    q.put(("progress", f"[{done}/{total}] {note}"))
+
+                res = pdfmerge.merge(items, out, on_progress=prog)
+                q.put(("done", res))
+            except BaseException as exc:  # noqa: BLE001 - 连 ImportError 一起回传
+                q.put(("error", exc))
+
+        threading.Thread(target=work, daemon=True, name="longshot-merge").start()
+
+        def poll() -> None:
+            try:
+                while True:
+                    kind, payload = q.get_nowait()
+                    if kind == "progress":
+                        status_var.set(str(payload))
+                    elif kind == "done":
+                        busy["run"] = False
+                        btn_add.state(["!disabled"])
+                        btn_clear.state(["!disabled"])
+                        btn_merge.state(["!disabled"])
+                        last_result["path"] = payload.out_path
+                        btn_open.state(["!disabled"])
+                        status_var.set(payload.summary().replace("\n", "  ·  "))
+                        messagebox.showinfo(
+                            "合并完成",
+                            f"{payload.pages} 页 → \n{payload.out_path}"
+                            + (
+                                "\n\n（目标同名，已自动加 (1) 保存，原文件没动）"
+                                if payload.out_path.name != Path(out).name
+                                else ""
+                            ),
+                        )
+                        return
+                    else:
+                        busy["run"] = False
+                        btn_add.state(["!disabled"])
+                        btn_clear.state(["!disabled"])
+                        btn_merge.state(["!disabled"])
+                        status_var.set("合并失败")
+                        messagebox.showerror(
+                            "合并失败", f"{type(payload).__name__}: {payload}"
+                        )
+                        return
+            except queue.Empty:
+                pass
+            root.after(120, poll)
+
+        root.after(120, poll)
+
+    def on_open() -> None:
+        target = last_result["path"]
+        if not target:
+            return
+        try:
+            paths.open_in_default_app(target)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("打不开文件", f"{target}\n{exc}")
+
+    btn_add.configure(command=on_add)
+    btn_clear.configure(command=on_clear)
+    btn_merge.configure(command=on_merge)
+    btn_open.configure(command=on_open)
+    _relayout()
+
+    return {
+        "add_file": add_file,
+        "rows": rows,
+        "status_var": status_var,
+        "validate": _first_error,
+        "move": _move,
+        "remove": _remove,
+        "btn_add": btn_add,
+        "btn_merge": btn_merge,
+        "btn_open": btn_open,
+        "outer": outer,
+    }
+
+
 # --------------------------------------------------------------------- 控制面板
 
 
@@ -145,6 +500,8 @@ def main() -> int:
     nav.add(tab_long, text="  滚动截长图  ")
     tab_shots = ttk.Frame(nav, padding=(10, 8))
     nav.add(tab_shots, text="  连续截图整合  ")  # 与上一个同级并列
+    tab_merge = ttk.Frame(nav, padding=(10, 8))
+    nav.add(tab_merge, text="  PDF 合并  ")
 
     state: dict = {
         "region": None,
@@ -160,6 +517,7 @@ def main() -> int:
     outer = ttk.Frame(tab_long)
     outer.pack(fill="both", expand=True)
     shots_panel = None  # 由 main() 末尾填充；on_close 里要在关闭前停掉它的轮询
+    merge_panel = None  # 同上：采集完成后要把结果登记进合并清单
 
     ttk.Label(outer, text="滚动截长图 → 多页 PDF", style="Title.TLabel").pack(anchor="w")
     ttk.Label(
@@ -568,6 +926,14 @@ def main() -> int:
             )
             status_var.set(("已停止，半成品已导出：" if stopped else "完成：") + str(pdf))
             count_var.set(f"帧 {frames} · 页 {pages} · 行 {rows}")
+            # 结果同时登记到「PDF 合并」清单：断点续存时用户手里是
+            # 长图.pdf / 长图(1).pdf / 长图(2).pdf 这么几段，正好按顺序待合并。
+            # 同名自动加 (1) 由 paths.unique_path 保证，这里只负责登记。
+            if merge_panel is not None:
+                try:
+                    merge_panel["add_file"](state["pdf"])
+                except Exception:  # noqa: BLE001 - 登记失败绝不能影响「已保存」这个事实
+                    pass
         else:
             status_var.set("未生成 PDF")
             messagebox.showerror("采集失败", message or "未知原因")
@@ -685,6 +1051,16 @@ def main() -> int:
     # 挂到 root 上：关窗时要调它的 shutdown()（停掉 F9 轮询），
     # 版式审计脚本也能直接拿到面板句柄。
     root._shots_panel = shots_panel
+
+    merge_panel = build_merge_tab(
+        tab_merge,
+        tk=tk,
+        ttk=ttk,
+        filedialog=filedialog,
+        messagebox=messagebox,
+        root=root,
+    )
+    root._merge_panel = merge_panel
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh_region_text()

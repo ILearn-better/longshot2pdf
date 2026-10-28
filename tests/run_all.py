@@ -24,14 +24,16 @@ SUITES = [
     "test_region.py",       # 截取区域：框选、收口、九宫格对齐、按比例改尺寸
     "test_shots.py",        # 连续截图整合：尺寸/位置对齐、页数估算、清晰度、扫描滤镜
     "test_export.py",       # 连续截图整合：docx / PDF 真的写得出来
-    "test_pipeline.py",     # 编排（自动 / 手动滚动）
+    "test_pipeline.py",     # 编排（自动 / 手动滚动、留白穿越、同名避让）
+    "test_pdfmerge.py",     # 按页码合并 PDF：范围解析、页序、零重编码
     "test_gui_hide.py",     # 界面：最小化时间线
     "test_shots_panel.py",  # 界面：连续截图面板（整屏/框选、顺序、联动、导出）
+    "test_merge_ui.py",     # 界面：PDF 合并清单（校验、排序、真合并）
 ]
 
-# 界面那两条需要 tkinter：嵌入版 / 精简版 Python 没有它，
+# 界面那几条需要 tkinter：嵌入版 / 精简版 Python 没有它，
 # 这种环境里跳过而不是判失败 —— 采集内核本身跟 tkinter 无关。
-NEEDS_TK = {"test_gui_hide.py", "test_shots_panel.py"}
+NEEDS_TK = {"test_gui_hide.py", "test_shots_panel.py", "test_merge_ui.py"}
 
 
 def _has_tk() -> bool:

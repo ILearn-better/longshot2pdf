@@ -561,6 +561,45 @@ class StreamStitcher:
         self.total_rows += h
         self._drain()
 
+    def append_blank(self, rows: int, template: np.ndarray | None = None) -> int:
+        """插入一段「留白」行，用于跨越大片空白区。
+
+        为什么需要：拼接靠内容重叠定位，而**空白区没有任何可定位的内容**。
+        滚过去以后前后两帧一模一样，位移量根本量不出来；如果干脆不记这段，
+        成品会把留白挤掉（版面被压扁），或者在重新接上时错位。
+        调用方（编排层）按「步数 × 实测 unit_px」给出估计高度，这里补进去。
+
+        template : 当时的空白画面。取它**中间那一行**重复填充，于是底色与
+            周围完全一致 —— 深色主题补白条、写了灰底补白条都会很刺眼。
+            None 时用白色（普通文档的默认纸色）。
+
+        返回实际插入的行数（rows ≤ 0 时返回 0，不改变状态）。
+        """
+        n = int(rows)
+        if n <= 0:
+            return 0
+        if template is not None and getattr(template, "ndim", 0) == 3:
+            src = template
+            if src.shape[1] != self.width:
+                src = self._fit(src)
+            row = src[int(src.shape[0]) // 2 : int(src.shape[0]) // 2 + 1]
+            if row.shape[0] != 1:
+                row = np.full((1, self.width, 3), 255, dtype=np.uint8)
+        else:
+            row = np.full((1, self.width, 3), 255, dtype=np.uint8)
+
+        # 分块填充：一次 np.empty(rows, w, 3) 在 8 屏留白时已有几十 MB，
+        # 而 append 每块都会立刻 drain 落盘，所以按「一页」为块，内存恒定。
+        left = n
+        step = max(1, self.page_h)
+        while left > 0:
+            take = min(step, left)
+            block = np.empty((take, self.width, 3), dtype=np.uint8)
+            block[:] = row
+            self.append(block)
+            left -= take
+        return n
+
     def finish(self) -> list[Path]:
         """把不满一页的残留内容也出一页，返回全部页 JPEG 路径。"""
         if self._fill > 0:

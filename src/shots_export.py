@@ -121,7 +121,9 @@ def export_document(
             from .docxwriter import write_docx
 
             placed = prepare(shots, lay)
-            write_docx(
+            # 写函数会自己避让同名文件，返回**实际**落地的路径 ——
+            # 这里必须接收它，否则统计体积时 st_size 会去读一个不存在的老名字。
+            out_path = write_docx(
                 [p.image for p in placed],
                 out_path,
                 # 段落对齐 = 需求里的「位置对齐」；单图一页时也就是水平居中/左/右
@@ -141,7 +143,7 @@ def export_document(
             # render_pages 出来的画布已经是「排版尺寸 × 清晰度倍数」，而 img2pdf
             # 只按宽高比例决定页尺寸，所以物理版面一模一样，只是每英寸像素更多。
             canvases = render_pages(shots, lay)
-            images_to_pdf(canvases, out_path, quality=int(quality))
+            out_path = images_to_pdf(canvases, out_path, quality=int(quality))
             images = len(shots)
             pages_est = len(canvases)  # PDF 的页数就是画布数，不用估
     except OSError as exc:

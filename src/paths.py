@@ -212,6 +212,48 @@ def with_suffix_for(path: str | Path, suffix: str) -> Path:
     return p.with_name(p.name + want)
 
 
+def unique_path(path: str | Path, *, max_index: int = 9999) -> Path:
+    """同名文件已存在时，按 ``名字(1).pdf`` / ``名字(2).pdf`` 往后找空位。
+
+    为什么值得单独一个函数
+    ----------------------
+    截长图这件事最贵的成本是用户的时间：500 页滚了半小时，最后因为
+    「文件已存在」而保存失败，等于白干。而 Windows 的默认行为有两种都很糟：
+    ``open(path, "wb")`` 直接覆盖（上一份被无声吃掉），
+    或者某些工具弹一个「是否覆盖」把流程卡住（无人值守时直接挂死）。
+
+    这里统一成「永不覆盖、永不失败」：存到第一个空闲编号为止。
+
+    编号规则
+    --------
+    - 后缀保留：``a.pdf`` → ``a(1).pdf``，扩展名不变（否则双击打不开）；
+    - 只在**最后一段扩展名**前插入序号，``报告.v2.pdf`` → ``报告.v2(1).pdf``；
+    - 从 (1) 开始数，因为这是用户看得懂的写法；已存在的名字不跳号，逐个探。
+
+    参数
+    ----
+    path : 期望路径
+    max_index : 最多试到第几号，超了抛 OSError（防止目录里有变态数量的同名文件时死循环）
+
+    返回
+    ----
+    一个**当前不存在**的路径。注意：它只保证「调用这一刻为空」，
+    真正的排他创建仍由调用方 open() 完成（这里不做占位）。
+    """
+    p = Path(path)
+    if not p.exists():
+        return p
+    stem = p.stem
+    suffix = p.suffix
+    for index in range(1, max_index + 1):
+        cand = p.with_name(f"{stem}({index}){suffix}")
+        if not cand.exists():
+            return cand
+    raise OSError(
+        f"「{p.name}」已经存在 {max_index} 个同名副本，找不到可用编号：{p.parent}"
+    )
+
+
 # ---------------------------------------------------------------- 打开文件
 
 

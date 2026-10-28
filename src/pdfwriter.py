@@ -89,6 +89,8 @@ def jpegs_to_pdf(
     out_path: Path,
     page_w_pt: float = A4_WIDTH_PT,
     page_ratio: float = DEFAULT_PAGE_RATIO,
+    *,
+    unique: bool = True,
 ) -> Path:
     """把一串页 JPEG 合成一个多页 PDF。
 
@@ -99,6 +101,9 @@ def jpegs_to_pdf(
     page_w_pt : 页的物理宽度（pt）。固定为 A4 宽，让阅读器里显示大小稳定，
         不随截图区域的像素宽度而变。
     page_ratio : 页高 / 页宽。与切页时的像素比例保持一致，图片才不会被拉伸。
+    unique : 目标已存在时自动改名为 ``名字(1).pdf`` 而不是覆盖（默认开）。
+        滚动截图最贵的成本是用户时间，绝不能因为同名把上一份悄悄吃掉 ——
+        见 ``paths.unique_path``。
 
     尺寸防爆
     --------
@@ -121,6 +126,8 @@ def jpegs_to_pdf(
         out_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
+    if unique:
+        out_path = paths.unique_path(out_path)
     page_w, page_h = _fit_page_size(page_w_pt, page_ratio)
 
     # layout_fun 固定成 (宽, 高) 的定点布局：img2pdf 默认会按图片 DPI 算尺寸，
@@ -199,6 +206,7 @@ def images_to_pdf(
     *,
     page_w_pt: float = A4_WIDTH_PT,
     quality: int = 85,
+    unique: bool = True,
 ) -> Path:
     """一组**尺寸各不相同**的图片 → 多页 PDF，每页按自己的比例出。
 
@@ -225,6 +233,8 @@ def images_to_pdf(
         out_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise RuntimeError(paths.explain_os_error(exc, out_path)) from exc
+    if unique:
+        out_path = paths.unique_path(out_path)
     tmp_dir = Path(tempfile.mkdtemp(prefix="longshot_pages_"))
     try:
         # 局部变量不能叫 paths：会和上面 `from . import paths` 撞名，

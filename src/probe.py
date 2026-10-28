@@ -131,6 +131,98 @@ def _auto_threshold(noise: float, threshold: float | None = None) -> float:
     return float(min(MAX_THRESHOLD, max(DEFAULT_THRESHOLD, NOISE_GAIN * noise)))
 
 
+# ---------------------------------------------------------------- 空白画面
+#
+# 「这一帧是不是一片空白」是滚动检测的**必需品**，不是锦上添花：
+# 滚轮明明生效了，但新露出来的是一片白纸 / 页边距 / 图表下方的留白，
+# 前后两帧字面上一模一样 —— 只比像素的话，「到底了」和「正在穿过留白」
+# 这两个完全不同的事实会给出同一个观测值（零位移）。
+# 编排层据此把留白误判成结尾，用户就会拿到一份只有前半段的 PDF。
+#
+# 判据用**灰度标准差**：纯白纸、纯色底、深色主题的空页都接近 0~1；
+# 哪怕只有一行小字也会把它顶到 3 以上。这道分界线比「平均梯度」稳，
+# 因为 1px 的细横线（表格线）梯度贡献不大，但标准差会明显抬头。
+
+# 灰度标准差低于此值即视为「没有可比对的内容」
+BLANK_STD = 2.5
+# 平均绝对梯度低于此值（配合标准差）才算空白：防止大片均匀平涂的彩色背景被误判
+BLANK_EDGE = 1.2
+# 判据抽样步长：整帧 1000x1400 全算要 4M 次浮点，抽一半足够且快 4 倍
+BLANK_SAMPLE = 2
+
+
+def frame_flatness(frame: np.ndarray) -> tuple[float, float]:
+    """返回 (灰度标准差, 平均绝对梯度)，都按 ``BLANK_SAMPLE`` 降采样后统计。
+
+    返回值是「画面有多少可比对的结构」的度量：
+    纯色 ≈ (0, 0)；有文字的正文 ≈ (20~60, 3~20)。
+    """
+    if frame is None or frame.size == 0:
+        return 0.0, 0.0
+    g = frame.astype(np.float32)
+    if g.ndim == 3:
+        g = g.mean(axis=2)
+    g = g[::BLANK_SAMPLE, ::BLANK_SAMPLE]
+    if g.shape[0] < 2 or g.shape[1] < 2:
+        return 0.0, 0.0
+    std = float(g.std())
+    edge = float(
+        (np.abs(np.diff(g, axis=1)).mean() + np.abs(np.diff(g, axis=0)).mean()) * 0.5
+    )
+    return std, edge
+
+
+def is_blank_frame(
+    frame: np.ndarray, *, std: float = BLANK_STD, edge: float = BLANK_EDGE
+) -> bool:
+    """这一帧是不是「一片空白」（没有可用于比对的内容）。
+
+    两个条件同时成立才算空白：结构少（标准差低）**且** 边缘少（梯度低）。
+    只看标准差的话，一块均匀但很亮的彩色底（比如浅蓝表格底色铺满）会被
+    误判；只看梯度的话，压缩噪声大的空白页会被误判成有内容。
+    """
+    s, e = frame_flatness(frame)
+    return s < std and e < edge
+
+
+def content_top(frame: np.ndarray, *, std: float = BLANK_STD, min_rows: int = 3) -> int:
+    """从上往下找第一行「有内容」的行号；整帧都空白时返回帧高。
+
+    用途：跨越大片留白之后，重新看到内容时往往**上面是空白、下面是正文**。
+    这时候不能整帧塞进缓冲区（上半截会把留白重复一遍），也不能只看
+    locate（留白区没有重叠，它无从下手）。逐行看看哪一行开始有结构，
+    就是新内容的真实起点 —— 纯算术，不依赖任何匹配。
+
+    min_rows : 连续多少行有结构才算「开始有内容」。取 3 是为了过滤
+        单行噪点、JPEG 块边界这种孤立亮线。
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return 0
+    g = frame.astype(np.float32)
+    if g.ndim == 3:
+        g = g.mean(axis=2)
+    g = g[::BLANK_SAMPLE, ::BLANK_SAMPLE]
+    h = int(g.shape[0])
+    if h < 1:
+        return 0
+    row_std = g.std(axis=1)
+    live = row_std >= std
+    if not live.any():
+        return int(frame.shape[0])
+    span = max(1, int(min_rows))
+    # 找第一段「连续 span 行都有结构」的起点
+    run = 0
+    for i, flag in enumerate(live):
+        if flag:
+            run += 1
+            if run >= span:
+                return int((i - span + 1) * BLANK_SAMPLE)
+        else:
+            run = 0
+    idx = int(np.argmax(live))
+    return int(idx * BLANK_SAMPLE)
+
+
 def _restore_error(a: np.ndarray, b: np.ndarray) -> float:
     """两帧「同一位置」的最小 MAD，允许 ±1px 的整行偏移。
 

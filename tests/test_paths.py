@@ -9,6 +9,7 @@
 3. check_target 拦下结尾空格与点、上级是文件；正常路径放行
 4. explain_os_error 把 WinError 206/183/5/32 翻成人话（含「怎么办」）
 5. with_suffix_for 只替换像格式的后缀，``报告.v2`` 不被吃掉
+6. unique_path 同名时按 (1)(2) 递增，原文件一字不动，编号用尽抛错
 
 直接运行：  python tests/test_paths.py
 """
@@ -161,9 +162,46 @@ def case_suffix() -> None:
     print(f"      目录结构保留：{got}")
 
 
+def case_unique(tmp: Path) -> None:
+    print("\n[6] 同名避让（同名文件不再覆盖，按 (1)(2) 递增）")
+    target = tmp / "长图.pdf"
+    # 不存在时原样返回
+    assert paths.unique_path(target) == target
+    print("      不存在 → 原名")
+
+    target.write_bytes(b"first")
+    got1 = paths.unique_path(target)
+    assert got1.name == "长图(1).pdf", got1
+    got1.write_bytes(b"second")
+    got2 = paths.unique_path(target)
+    assert got2.name == "长图(2).pdf", got2
+    print(f"      已存在两次 → {got1.name} / {got2.name}")
+
+    # 原文件必须一个字节都没被改动
+    assert target.read_bytes() == b"first"
+    print("      原文件内容未被改动")
+
+    # 版本号式文件名：序号插在**最后一段扩展名**前，不吃掉 .v2
+    v = tmp / "报告.v2.pdf"
+    v.write_bytes(b"x")
+    assert paths.unique_path(v).name == "报告.v2(1).pdf", paths.unique_path(v)
+    print("      报告.v2.pdf → 报告.v2(1).pdf")
+
+    # 上限兜底：塞满 3 个编号后应该抛 OSError 而不是死循环
+    for i in (1, 2, 3):
+        (tmp / f"满({i}).pdf").write_bytes(b"x")
+    (tmp / "满.pdf").write_bytes(b"x")
+    try:
+        paths.unique_path(tmp / "满.pdf", max_index=3)
+    except OSError as exc:
+        print(f"      编号用尽 → OSError：{str(exc)[:40]}…")
+    else:
+        raise AssertionError("编号用尽时没有抛错，可能死循环")
+
+
 def main() -> int:
     print("=" * 64)
-    print("路径口径 · 桌面 / 保留名 / 预检 / 错误转译 / 后缀")
+    print("路径口径 · 桌面 / 保留名 / 预检 / 错误转译 / 后缀 / 同名避让")
     print("=" * 64)
     try:
         case_desktop()
@@ -171,6 +209,8 @@ def main() -> int:
         case_check_target()
         case_explain()
         case_suffix()
+        with tempfile.TemporaryDirectory(prefix="ls2pdf_paths_") as tag:
+            case_unique(Path(tag))
     except AssertionError as exc:
         print(f"\n[FAIL] {exc}")
         return 1

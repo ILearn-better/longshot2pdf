@@ -471,6 +471,69 @@ def case_manual_upward_scroll() -> None:
     )
 
 
+def case_blank_gap() -> None:
+    """正文中间夹着一大片留白：不能在这里判定「已到底」。
+
+    这是用户实际反馈的故障形态：滚轮一直有效，但进入页边距/大段空白之后
+    前后两帧一模一样，旧逻辑连判两次「画面没动」就收尾，后半篇全丢。
+    验收两条：
+        1. 采集必须越过留白、把后面的正文拿全（拼接高度远超留白起点）；
+        2. 末尾若干行必须与原文一致 —— 只"没停"但内容错位同样不算过。
+    """
+    doc = M.make_document(width=800, height=9000, seed=5)
+    gap_start, gap_end = 3000, 5500
+    doc[gap_start:gap_end] = 252           # 2.5 屏纯白
+    view_h = 600
+    vs = M.VirtualScreen(doc, view_h, unit_px=100)
+    notes: list[str] = []
+
+    cfg = CaptureConfig(
+        region=(0, 0, 800, view_h), out_path=OUT / "blank_gap.pdf", keep_temp=True
+    )
+    res = run(cfg, on_progress=lambda f, p, r, n: notes.append(n), deps=make_deps(vs))
+
+    assert res.ok, res.message
+    got = load_pages(res.temp_dir)
+    # 旧逻辑会在留白入口处收尾（≈gap_start），这里必须明显越过 gap_end
+    assert got.shape[0] > gap_end, (
+        f"只拼到 {got.shape[0]} 行（留白是 {gap_start}~{gap_end}），"
+        "说明又把一大片留白当成结尾了"
+    )
+    assert any("留白" in n or "空白" in n for n in notes), "没有报告穿越留白的过程"
+
+    # 末尾必须与原文对齐：证明穿过留白之后重新接上了，而不是错位追加
+    tail = 600
+    diff = mad(got[-tail:], doc[-tail:])
+    assert diff < 6.0, f"留白之后内容错位（末尾 MAD={diff:.2f}）"
+    print(
+        f"  [OK] 跨过 {gap_end - gap_start}px 留白：拼出 {got.shape[0]} 行"
+        f"（{res.pages} 页），末尾与原文对齐 MAD={diff:.2f}"
+    )
+
+
+def case_output_dedup() -> None:
+    """同名输出不覆盖：第二次自动落到 名字(1).pdf，第一份内容一字不动。"""
+    doc = M.make_document(width=640, height=4000)
+    view_h = 600
+    out = OUT / "同名.pdf"
+
+    def once() -> object:
+        vs = M.VirtualScreen(doc, view_h, unit_px=100)
+        cfg = CaptureConfig(region=(0, 0, 640, view_h), out_path=out)
+        return run(cfg, deps=make_deps(vs))
+
+    first = once()
+    assert first.ok and first.pdf_path == out, first.pdf_path
+    keep = out.read_bytes()
+
+    second = once()
+    assert second.ok, second.message
+    assert second.pdf_path is not None and second.pdf_path != out
+    assert second.pdf_path.name == "同名(1).pdf", second.pdf_path.name
+    assert out.read_bytes() == keep, "第一份被覆盖了"
+    print(f"  [OK] 同名避让：{out.name} 保留原样，第二份落到 {second.pdf_path.name}")
+
+
 def main() -> int:
     shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)
@@ -492,6 +555,8 @@ def main() -> int:
     case_manual_overscroll()
     case_manual_idle_finish()
     case_manual_upward_scroll()
+    case_blank_gap()
+    case_output_dedup()
     print("全部通过")
     return 0
 

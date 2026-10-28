@@ -40,7 +40,7 @@ import numpy as np
 from . import winapi
 from .capture import Grabber, Region
 from .pdfwriter import A4_WIDTH_PT, jpegs_to_pdf
-from .probe import probe
+from .probe import content_top, is_blank_frame, probe
 from .stitch import StreamStitcher, locate, page_height_for
 
 # on_progress(帧数, 页数, 已拼行数, 人类可读状态)
@@ -214,6 +214,35 @@ DIRTY_JITTER_GAIN = 2.5
 # 一轮手动循环 ≈ settle_ms + 抓帧 ≈ 250ms，所以 3 ≈ 0.8s（够回滚了），12 ≈ 3s。
 MANUAL_LOST_HINT = 3
 MANUAL_LOST_GIVE_UP = 12
+
+
+# ---------------------------------------------------------------- 空白区穿越
+#
+# 最伤用户的一种失败：滚轮明明一直生效，程序却在「正文结束、下面是留白」的那
+# 一瞬间宣布「已到底部」，用户拿到一份只有前半段的 PDF —— 而且他还以为是自己
+# 没滚完。根因是观测不足：留白区里前后两帧**字面上一模一样**，
+# 「到底了」和「正在穿过留白」在像素上看不出任何区别。
+#
+# 解法分三步，成本只在「疑似结束」时付出：
+#   1) 认出这一帧是空白（probe.is_blank_frame，灰度标准差 + 梯度双判据）；
+#   2) 空白就**不算到底**，加大步长继续滚，按「步数 × 实测 unit_px」记下
+#      跨过的留白高度（单位像素估计，不是瞎猜整屏）；
+#   3) 有内容的画面停住时，补一次「向上滚一格看变不变」的确认：
+#      向上有变化 → 下面确实没了，是到底；向上也没变化 → 上下都是留白，
+#      继续加大步长穿过去。
+#
+# 跨过留白之后重新接上时，把估计的留白高度补进缓冲区，版面不会被压扁。
+# 留白高度有上限（MAX_BLANK_SCREENS 屏），防止在一个真正空白的界面里无限滚。
+
+# 连续多少轮「空白且无位移」后认定真的没有内容了
+BLANK_MAX_ROUNDS = 24
+# 累计跨过的留白最多算多少屏（超过就收尾，避免在空页面上无限滚）
+MAX_BLANK_SCREENS = 12.0
+# 空白区里每轮步长的放大系数 / 上限（占视口高度的比例）
+BLANK_STEP_GROW = 1.6
+BLANK_STEP_CAP_RATIO = 0.45
+# 判定「向上滚确实看到了新东西」的像素差下限
+BOTTOM_CONFIRM_MAD = 1.5
 
 
 def _stable_box(region: Region) -> Region:
@@ -561,8 +590,79 @@ def run(
 
         else:
             # ================= 自动滚动 =================
-            stalls = 0          # 连续「滚了但画面没动」的次数
-            retries = 0         # 连续匹配失败次数
+            stalls = 0            # 连续「画面有内容、但滚了没动」的次数
+            retries = 0           # 连续匹配失败次数
+            last_delta = 0.0      # 最近一次实测位移，留白区的估计基准
+            blank_px = 0.0        # 已跨过、还没写进缓冲区的留白高度（估计）
+            blank_rounds = 0      # 连续「空白且无位移」的轮数
+            max_blank_px = float(region[3]) * MAX_BLANK_SCREENS
+
+            # 空白区里步长能放大到多少：上限取视口高度的 45%，
+            # 这样留白结束、内容回来时相邻两帧仍有重叠（否则 locate 直接失效）。
+            steps_cap = 50
+            if unit_px > 0:
+                steps_cap = max(
+                    steps, min(50, int(region[3] * BLANK_STEP_CAP_RATIO / unit_px) or 1)
+                )
+
+            def expected_shift() -> float:
+                """这一轮滚轮大概能带出多少像素（留白区的位移估计基准）。
+
+                优先用 probe 实测的 unit_px；没有就退到最近一次实测位移；
+                再没有就按视口高度的三分之一猜 —— 宁可估歪一点，
+                也好过把整片留白当成"不存在"直接挤掉。
+                """
+                if unit_px > 0:
+                    return steps * unit_px
+                if last_delta > 0:
+                    return last_delta
+                return region[3] * 0.35
+
+            def grow_steps() -> None:
+                nonlocal steps
+                steps = min(steps_cap, max(steps + 1, int(round(steps * BLANK_STEP_GROW))))
+
+            def cross_blank(cur: np.ndarray, why: str) -> bool:
+                """把这一帧当作留白：记账 + 加大步长继续。返回 True 表示该收尾了。"""
+                nonlocal blank_px, blank_rounds, last_note, stopped
+                blank_rounds += 1
+                blank_px += expected_shift()
+                if blank_rounds > BLANK_MAX_ROUNDS or blank_px > max_blank_px:
+                    last_note = (
+                        f"连续 {blank_rounds} 轮滚不出新内容（已跨过约 "
+                        f"{blank_px / max(1, region[3]):.0f} 屏留白），按到底部收尾；"
+                        "若后面其实还有内容，请从断开处重新开始一段，"
+                        "再用「PDF 合并」按页码接起来"
+                    )
+                    stopped = True
+                    return True
+                grew = steps
+                grow_steps()
+                report(
+                    total_frames, stitcher.page_count, stitcher.total_rows,
+                    f"{why}：画面没有可比对的内容（空白区/页边距），"
+                    f"已跨过约 {blank_px:.0f}px，步长 {grew}→{steps} 格继续",
+                )
+                return False
+
+            def confirm_bottom(frame: np.ndarray) -> bool:
+                """向下滚不动时，用「向上滚是否变化」区分「到底」和「卡在留白里」。
+
+                * 到底：向下没有位移（下面真的没了），向上**一定**有位移；
+                * 留白：上下都没有可比对的内容，两个方向都看不出位移。
+
+                这个区别只用当前一帧是看不出来的，必须额外投一次反向滚轮。
+                代价是一轮 `settle_ms` 的等待，只在「疑似结束」时付一次，
+                不影响正常采集速度。
+                """
+                d.wheel(steps)
+                up, _ = _grab_stable(d, region, cfg.settle_ms)
+                back = locate(up, frame)
+                moved = bool(back is not None and back[1] > 0) or (
+                    _mad(up, frame) >= BOTTOM_CONFIRM_MAD
+                )
+                d.wheel(-steps)   # 结论如何都先滚回原处，下一轮从同一位置接着来
+                return moved
 
             while not stopped and total_frames < cfg.max_frames:
                 if should_stop and should_stop():
@@ -583,8 +683,42 @@ def run(
                 loc = locate(prev, cur)
 
                 if loc is None:
-                    # 多半滚过头了（一帧内位移超过一屏，重叠为 0）：
-                    # 先滚回去，再减半步长重试。宁可重滚也不要写入错位内容。
+                    # ① 整帧留白：locate 因为「没有信息」而放弃，它不是错误，
+                    #    而是「这里判断不了」。绝不能当成到底。
+                    if is_blank_frame(cur):
+                        if cross_blank(cur, "空白区"):
+                            break
+                        continue
+
+                    # ② 刚从留白里出来：上一帧是内容、这一帧是「上面留白 + 下面正文」。
+                    #    留白区里的位移量无从测量，所以按 step × unit_px 的估计值补行，
+                    #    再用逐行扫描找出新内容真正的起点。
+                    if blank_px >= 1:
+                        top = content_top(cur)
+                        if top >= int(cur.shape[0]):
+                            if cross_blank(cur, "留白边缘"):
+                                break
+                            continue
+                        rows = 0
+                        if top > 0:
+                            rows = stitcher.append_blank(
+                                int(min(blank_px, max_blank_px)), template=cur
+                            )
+                        stitcher.append(cur[top:])
+                        prev = cur
+                        total_frames += 1
+                        last_delta = float(max(top, 0))
+                        report(
+                            total_frames, stitcher.page_count, stitcher.total_rows,
+                            f"跨过约 {rows}px 留白后重新接上（本帧新内容从第 "
+                            f"{top} 行开始）",
+                        )
+                        blank_px = 0.0
+                        blank_rounds = 0
+                        stalls = 0
+                        continue
+
+                    # ③ 真·匹配失败（多半滚过头或区域含固定条）：滚回去、减半步长
                     retries += 1
                     if retries > 3:
                         last_note = (
@@ -615,15 +749,33 @@ def run(
                 new_start, delta, err = loc
 
                 if delta <= 0:
-                    # 画面完全没变，连续几次才认定到底（一次可能只是加载中）
+                    # 画面没变：可能是到底，也可能是这一屏本身是空白。
+                    if is_blank_frame(cur):
+                        if cross_blank(cur, "空白区"):
+                            break
+                        continue
+
                     stalls += 1
-                    if stalls >= 2:
+                    if stalls == 1:
+                        # 第一次不动可能只是惰性加载/图片解码还没渲染完
+                        d.sleep(0.12)
+                        continue
+
+                    if confirm_bottom(cur):
                         last_note = "已滚动到底部，采集结束"
                         break
-                    d.sleep(0.12)
+
+                    # 向下不动、向上也不动 → 不是到底，是一片没有内容的留白。
+                    # 不能就此收尾（这正是用户反馈的「误判到底」）。
+                    stalls = 0
+                    if cross_blank(cur, "上下都无位移的留白"):
+                        break
                     continue
 
                 stalls = 0
+                blank_rounds = 0
+                blank_px = 0.0      # 留白已含在 cur[new_start:] 里，别重复补
+                last_delta = float(delta)
                 accept(cur, new_start, delta, err, jitter)
 
                 # 步长自适应微调：目标是一帧走 target_step

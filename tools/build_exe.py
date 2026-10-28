@@ -49,8 +49,9 @@ NAME = "LongShot2PDF"
 # 排除清单：每一类都写了「为什么可以排」。
 # 判定标准只有一条 —— 运行期（GUI + CLI + 导出）真的用不到。
 EXCLUDES = [
-    # 1) 只在自测里读回 PDF 页序用，缺了会打印「跳过」
-    "pypdf",
+    # 1) PyPDF2 是 pypdf 的旧名，两者只能留一个。
+    #    注意 **pypdf 本身不能排**：v0.10 的「按页码合并」直接依赖它，
+    #    排掉以后合并功能会在运行时报「缺少 pypdf」——而且体积只省 0.5 MB。
     "PyPDF2",
     # 2) 打包/安装工具链，运行时不存在也不需要
     "pip",
@@ -88,7 +89,12 @@ EXCLUDES = [
     "telnetlib",
     "nntplib",
     "xmlrpc",
-    "xml",
+    # 注意 xml **也不能排**（v0.10 实测踩到）：pypdf/_reader.py 顶层有
+    # `from .xmp import XmpInformation`，而 pypdf/xmp.py 顶层又
+    # `from xml.dom.expatbuilder import ExpatBuilderNS`。排掉 xml 以后
+    # exe 能启动、能截图、能出 PDF，只有「合并」报「缺少 pypdf」—— 因为
+    # pdfmerge 把所有 ImportError 都翻成了那句友好提示，真实原因被藏住了。
+    # 代价只有 xml.dom + pyexpat 约 300 KB，不值得省。
     "html",
     # 5) 并发/数据库/压缩存档：单线程跑，不写库
     "asyncio",
@@ -336,7 +342,10 @@ def build(*, upx_dir: Path | None, onedir: bool) -> Path:
 
     # img2pdf / gui / cli 都是在函数里 import 的，PyInstaller 能扫到，
     # 但 shots_gui 是 gui.py 里延迟导入的二级模块，显式声明一次更保险。
-    for mod in ("gui", "cli", "shots_gui"):
+    # pypdf 同样是在 pdfmerge / pdfwriter 函数体里 import 的（为了让
+    # 「没有 pypdf 也能出 PDF」这条降级路径成立），显式点名防止被漏收 ——
+    # 漏了的表现是：exe 能开界面、能截图，唯独「合并」按钮报缺少 pypdf。
+    for mod in ("gui", "cli", "shots_gui", "pypdf"):
         cmd += ["--hidden-import", mod]
 
     if upx_dir:
