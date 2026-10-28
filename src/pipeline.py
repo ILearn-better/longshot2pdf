@@ -24,6 +24,17 @@
     · 手动模式**不跑 probe**（probe 会滚下去再滚回来，会在用户眼皮底下动页面）；
     · 手动模式**不替用户滚回去**（位移是他的意图），接不上只能提示他回滚；
     · 手动模式**不恢复光标**（我们没动过它，用户可能已经自己挪走了）。
+
+自动模式下还有一层：**什么时候算采完**（cfg.stop_mode）
+
+    scroll  滚不动就停。投滚轮 → 比对 → 画面不再变化即收尾。
+            程序只做「替你按滚轮」这一件事，行为可预测（默认）。
+    auto    自动判断完成。整帧空白继续往下穿、滚不动时向上滚一格反向确认、
+            穿过的留白按估计高度补回版面。适合正文中间夹着大段空白的长文档。
+
+两者不是「好/坏」而是「可控/能猜」的取舍：auto 能救回被误判的结局，
+代价是它会自己做动作（多滚几屏、反向滚一次），滚动位置与预期不完全一致。
+默认取 scroll —— 用户要的是模拟滚轮，额外判断必须由他主动打开。
 """
 
 from __future__ import annotations
@@ -68,6 +79,14 @@ class CaptureConfig:
     #   "auto"   程序每帧投递滚轮，步长按 probe 实测值校准（默认，适合长文档一口气拉完）
     #   "manual" 用户自己滚，程序只负责抓帧和拼接（适合要看一眼再滚、或程序不吃合成滚轮）
     scroll: str = "auto"
+    # 自动模式下「什么时候算采完」—— 这是两个语义不同的判据，由用户选：
+    #   "scroll" 滚不动就停。只做一件事：投滚轮、比对、画面不再变化就收尾。
+    #            不判空白、不放步长、不反向确认。等价于「程序替你把滚轮按到底」。
+    #   "auto"   自动判断完成。整帧留白继续往下穿、滚不动时向上滚一格反向确认、
+    #            穿过的留白按估计高度补回版面。适合正文中间夹着一大屏空白的文档。
+    # 默认取 "scroll"：用户要的是「自动滚动 = 模拟鼠标滚动」这个最朴素的语义，
+    # 多出来的判断必须是他主动选的，而不是替他决定。
+    stop_mode: str = "scroll"
     # 仅 manual：多少秒没有检测到新内容就收尾。0 = 一直等，只由用户按停。
     # 不能靠「画面不动了」判结束 —— 用户停下来读一段话和滚到底，画面是一模一样的。
     idle_timeout: float = 60.0
@@ -218,9 +237,12 @@ MANUAL_LOST_GIVE_UP = 12
 
 # ---------------------------------------------------------------- 空白区穿越
 #
-# 最伤用户的一种失败：滚轮明明一直生效，程序却在「正文结束、下面是留白」的那
-# 一瞬间宣布「已到底部」，用户拿到一份只有前半段的 PDF —— 而且他还以为是自己
-# 没滚完。根因是观测不足：留白区里前后两帧**字面上一模一样**，
+# 这一整段只在 cfg.stop_mode == "auto"（自动判断完成）下生效；
+# 默认的 "scroll" 模式走到 delta<=0 就直接收尾，一行都不会执行到这里。
+#
+# 为什么需要它：最伤用户的一种失败是滚轮明明一直生效，程序却在「正文结束、
+# 下面是留白」的那一瞬间宣布「已到底部」，用户拿到一份只有前半段的 PDF ——
+# 而且他还以为是自己没滚完。根因是观测不足：留白区里前后两帧**字面上一模一样**，
 # 「到底了」和「正在穿过留白」在像素上看不出任何区别。
 #
 # 解法分三步，成本只在「疑似结束」时付出：
@@ -313,6 +335,16 @@ def run(
     d.enable_dpi()
 
     manual = str(getattr(cfg, "scroll", "auto") or "auto").lower() == "manual"
+
+    # 「什么时候算采完」的两种判据，见 CaptureConfig.stop_mode 的注释。
+    # 手动模式下这两个都不参与（收尾由 idle_timeout / ESC / 停止按钮决定）。
+    stop_mode = str(getattr(cfg, "stop_mode", "scroll") or "scroll").strip().lower()
+    if stop_mode not in ("scroll", "auto"):
+        stop_mode = "scroll"
+    smart_stop = (not manual) and stop_mode == "auto"
+    stop_label = (
+        "自动判断完成（会穿过空白区）" if smart_stop else "滚不动就停"
+    )
 
     # ---------- 0. 区域与输出 ----------
     region: Region = tuple(int(v) for v in cfg.region)  # type: ignore[assignment]
@@ -597,6 +629,12 @@ def run(
             blank_rounds = 0      # 连续「空白且无位移」的轮数
             max_blank_px = float(region[3]) * MAX_BLANK_SCREENS
 
+            # 开头亮一次当前判据：切换模式之后最容易搞混的就是「它到底在等什么」。
+            report(
+                total_frames, stitcher.page_count, stitcher.total_rows,
+                f"自动滚动：{stop_label}",
+            )
+
             # 空白区里步长能放大到多少：上限取视口高度的 45%，
             # 这样留白结束、内容回来时相邻两帧仍有重叠（否则 locate 直接失效）。
             steps_cap = 50
@@ -683,9 +721,28 @@ def run(
                 loc = locate(prev, cur)
 
                 if loc is None:
+                    # 「滚不动就停」模式下的唯一出路。它不参与「是否停下」的判断，
+                    # 但接不上时必须有地方可去，否则会原地重试到放弃。
+                    if not smart_stop and (is_blank_frame(cur) or is_blank_frame(prev)):
+                        # 这一帧（或上一帧）整片空白：没有可比对的结构，
+                        # 接不上是必然的，不是参数没调好。整帧追加 ——
+                        # 空白区本身没有缝，多算几十行白对内容没有影响，
+                        # 而「照搬真实画面」比「按步长估算高度」更忠实。
+                        # 这里**不判定是否到底**：下一轮照样投滚轮，
+                        # 直到画面真的不再变化（那才是这个模式的收尾条件）。
+                        stitcher.append(cur)
+                        prev = cur
+                        total_frames += 1
+                        stalls = 0
+                        report(
+                            total_frames, stitcher.page_count, stitcher.total_rows,
+                            "画面整片空白，无法与上一帧比对：已整帧追加，继续向下滚动",
+                        )
+                        continue
+
                     # ① 整帧留白：locate 因为「没有信息」而放弃，它不是错误，
                     #    而是「这里判断不了」。绝不能当成到底。
-                    if is_blank_frame(cur):
+                    if smart_stop and is_blank_frame(cur):
                         if cross_blank(cur, "空白区"):
                             break
                         continue
@@ -693,7 +750,7 @@ def run(
                     # ② 刚从留白里出来：上一帧是内容、这一帧是「上面留白 + 下面正文」。
                     #    留白区里的位移量无从测量，所以按 step × unit_px 的估计值补行，
                     #    再用逐行扫描找出新内容真正的起点。
-                    if blank_px >= 1:
+                    if smart_stop and blank_px >= 1:
                         top = content_top(cur)
                         if top >= int(cur.shape[0]):
                             if cross_blank(cur, "留白边缘"):
@@ -749,7 +806,21 @@ def run(
                 new_start, delta, err = loc
 
                 if delta <= 0:
-                    # 画面没变：可能是到底，也可能是这一屏本身是空白。
+                    # 「滚不动就停」：滚轮投了、画面一模一样 = 无法继续向下滚动。
+                    # 这就是这个模式的全部判据，不再问「是不是空白」「上面动不动」。
+                    if not smart_stop:
+                        last_note = "无法继续向下滚动（画面不再变化），采集结束"
+                        if is_blank_frame(cur):
+                            # 停在一片空白上是很可疑的：可能真的到头了，
+                            # 也可能只是页边距/大段空行。把这件事说出来，
+                            # 让用户自己决定要不要换判据重采，而不是替他决定。
+                            last_note += (
+                                "。注意：当前画面是空白区，若后面其实还有内容，"
+                                "请把停止条件改成「自动判断完成」再采一次"
+                            )
+                        break
+
+                    # 自动判断完成：画面没变可能是到底，也可能是这一屏本身是空白。
                     if is_blank_frame(cur):
                         if cross_blank(cur, "空白区"):
                             break

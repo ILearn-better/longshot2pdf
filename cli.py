@@ -54,6 +54,7 @@ DEFAULTS = {
     "page_ratio": 1.414,
     "max_frames": 20000,
     "scroll": "auto",
+    "stop_mode": "scroll",
     "idle_timeout": 60.0,
 }
 
@@ -328,6 +329,8 @@ def make_config(region: Region, out_path: Path, args) -> tuple[object, list[str]
         "max_pages": args.max_pages,
         "keep_temp": args.keep_temp,
         "scroll": "manual" if getattr(args, "manual", False) else "auto",
+        # 手动模式下这个字段不参与判定（收尾看 idle_timeout / ESC），原样带上即可
+        "stop_mode": str(getattr(args, "stop_mode", "scroll") or "scroll"),
         "idle_timeout": float(getattr(args, "idle_timeout", 60.0) or 0.0),
     }
     fields = {f.name for f in dataclasses.fields(CaptureConfig)}
@@ -475,6 +478,15 @@ def print_dry_run(region: Region, out_path: Path, args, ignored: list[str]) -> N
         print(
             f"滚动步长   : 视口 {height}px × (1 - 重叠 {args.overlap}) ≈ {step}px"
             f" → 约 {frames_per_page} 帧出 1 页"
+        )
+        smart = str(getattr(args, "stop_mode", "scroll")) == "auto"
+        print(
+            "停止条件   : "
+            + (
+                "自动判断完成 —— 整帧空白会继续往下穿，滚不动时向上滚一格反向确认"
+                if smart
+                else "滚不动就停 —— 画面不再变化即收尾（不做空白判断、不减步长）"
+            )
         )
     print(
         "估算页数   : 取决于目标文档总高度（无法预知），"
@@ -828,6 +840,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py --region 100,200,1200,900 --out 文档.pdf\n"
             "  python cli.py --select --overlap 0.2\n"
             "  python cli.py --select --manual              # 你自己滚，它只负责拼\n"
+            "  python cli.py --select --stop-mode auto      # 长文档：空白区也继续往下穿\n"
             "  python cli.py --fullscreen --max-pages 300 --quiet\n"
             "  python cli.py --dry-run --region 0,0,800,600 --out /tmp/x.pdf\n"
             "  python cli.py --merge 第一段.pdf=1-19 --merge 第二段.pdf=1-30 -o 全文.pdf\n"
@@ -876,6 +889,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manual", dest="manual", action="store_true",
                         help="手动滚动：程序不投滚轮，你自己滚，它只负责抓帧拼接"
                              "（适合要看一眼再滚、或程序不吃合成滚轮）")
+    parser.add_argument("--stop-mode", dest="stop_mode",
+                        choices=("scroll", "auto"), default="scroll",
+                        help="自动模式下什么时候算采完（默认 scroll）："
+                             "scroll = 滚不动就停，纯粹模拟滚轮，画面不再变化即收尾；"
+                             "auto = 自动判断完成，整帧空白会继续往下穿、滚不动时反向确认，"
+                             "适合正文中间夹着大段空白的长文档")
     parser.add_argument("--idle-timeout", dest="idle_timeout", type=float,
                         default=DEFAULTS["idle_timeout"], metavar="S",
                         help="仅 --manual：多少秒没有滚动就自动收尾，0 = 一直等"

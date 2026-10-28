@@ -621,8 +621,44 @@ def main() -> int:
     rb_manual.pack(side="left", padx=(12, 0))
     param_widgets.extend([rb_auto, rb_manual])
 
+    # ---- 停止条件（只对自动滚动有意义）----
+    # 两个语义不同的判据，谁也不能替代谁：
+    #   scroll 只模拟滚轮，画面不动就停，行为可预测；
+    #   auto   会主动判断「是不是还没到底」，能穿过大段空白，但会自己加动作。
+    # 默认 scroll —— 用户要的是「自动滚动 = 替我按滚轮」这个最朴素的语义，
+    # 额外判断必须由他主动打开（2026-10-28 明确要求）。
+    stop_var = tk.StringVar(value="scroll")
+    ttk.Label(box_param, text="停止条件").grid(row=8, column=0, sticky="w", pady=3)
+    stop_row = ttk.Frame(box_param)
+    stop_row.grid(row=8, column=1, columnspan=3, sticky="w", padx=8)
+    rb_stop_scroll = ttk.Radiobutton(
+        stop_row, text="滚不动就停", value="scroll", variable=stop_var
+    )
+    rb_stop_scroll.pack(side="left")
+    rb_stop_auto = ttk.Radiobutton(
+        stop_row, text="自动判断完成", value="auto", variable=stop_var
+    )
+    rb_stop_auto.pack(side="left", padx=(12, 0))
+    param_widgets.extend([rb_stop_scroll, rb_stop_auto])
+
+    stop_hint = ttk.Label(box_param, text="", foreground="#888888")
+    stop_hint.grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 2))
+
+    def refresh_stop_hint(*_args) -> None:
+        if str(stop_var.get()) == "auto":
+            stop_hint.configure(
+                text="空白区会继续往下滚、滚不动时反向确认；适合正文中间夹着大段空白的长文档"
+            )
+        else:
+            stop_hint.configure(
+                text="只投滚轮，画面不再变化即收尾；停在空白区时会明确提示你"
+            )
+
+    stop_var.trace_add("write", refresh_stop_hint)
+    refresh_stop_hint()
+
     idle_var = tk.IntVar(value=60)
-    add_spin(8, "无滚动收尾", idle_var, 0, 3600, "秒，仅手动模式；0 = 一直等（按 ESC 结束）")
+    add_spin(10, "无滚动收尾", idle_var, 0, 3600, "秒，仅手动模式；0 = 一直等（按 ESC 结束）")
 
     # ---- 开始时是否让开画面 ----
     # 面板只要还摆在屏幕上，就必然出现在每一帧里（尤其框选覆盖整个窗口时）。
@@ -632,11 +668,11 @@ def main() -> int:
     chk_hide = ttk.Checkbutton(
         box_param, text="开始后最小化面板", variable=hide_var,
     )
-    chk_hide.grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    chk_hide.grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
     param_widgets.append(chk_hide)
     ttk.Label(
         box_param, text="避免面板被截进画面；点任务栏图标可随时还原", foreground="#888888"
-    ).grid(row=9, column=3, sticky="w", padx=(6, 0))
+    ).grid(row=11, column=3, sticky="w", padx=(6, 0))
 
     # ---------------- 操作 ----------------
     box_action = ttk.Frame(outer)
@@ -660,12 +696,27 @@ def main() -> int:
     count_var = tk.StringVar(value="帧 0 · 页 0 · 行 0")
     ttk.Label(box_prog, textvariable=count_var, foreground="#555555").pack(anchor="w")
 
+    def sync_stop_state() -> None:
+        """「停止条件」只在自动滚动下有意义，手动模式置灰而不是隐藏。
+
+        置灰不隐藏：用户切回自动时会看到自己上次选的是哪个，
+        隐藏会让他以为这个选项消失了。
+        """
+        usable = (str(scroll_var.get()) != "manual") and not state["running"]
+        for widget in (rb_stop_scroll, rb_stop_auto):
+            try:
+                widget.state(["!disabled"] if usable else ["disabled"])
+            except Exception:  # noqa: BLE001
+                pass
+        stop_hint.configure(foreground="#888888" if usable else "#c0c0c0")
+
     def on_scroll_mode_changed(*_args) -> None:
         """切换滚动方式时改按钮文案和提示。
 
         文案要改是因为两种模式下「开始」之后发生的事完全不同：
         自动模式点完就不用管了，手动模式点完才是用户开始干活的时候。
         """
+        sync_stop_state()
         if state["running"]:
             return
         if str(scroll_var.get()) == "manual":
@@ -745,6 +796,8 @@ def main() -> int:
                 pass
         # 区域输入框任何时候都只读：它只用来展示框选结果，手改坐标没有意义
         entry_region.state(["!disabled", "readonly"])
+        # 「停止条件」还要额外考虑「手动模式下无意义」，统一在这里收口
+        sync_stop_state()
 
     def collect_params() -> dict:
         return {
@@ -758,6 +811,7 @@ def main() -> int:
             "max_frames": 20000,
             "keep_temp": False,
             "scroll": str(scroll_var.get() or "auto"),
+            "stop_mode": str(stop_var.get() or "scroll"),
             "idle_timeout": float(idle_var.get() or 0),
         }
 
@@ -873,7 +927,11 @@ def main() -> int:
         status_var.set(
             "面板即将最小化，现在请自己滚动页面；按 ESC 停止，点任务栏图标可还原"
             if manual
-            else "面板即将最小化，正在自动滚动；按 ESC 停止，点任务栏图标可还原"
+            else (
+                "面板即将最小化，正在自动滚动"
+                f"（{'自动判断完成' if str(stop_var.get()) == 'auto' else '滚不动就停'}）；"
+                "按 ESC 停止，点任务栏图标可还原"
+            )
         )
         root.update_idletasks()
         root.after(220, minimize_then_run)

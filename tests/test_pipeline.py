@@ -488,7 +488,8 @@ def case_blank_gap() -> None:
     notes: list[str] = []
 
     cfg = CaptureConfig(
-        region=(0, 0, 800, view_h), out_path=OUT / "blank_gap.pdf", keep_temp=True
+        region=(0, 0, 800, view_h), out_path=OUT / "blank_gap.pdf", keep_temp=True,
+        stop_mode="auto",
     )
     res = run(cfg, on_progress=lambda f, p, r, n: notes.append(n), deps=make_deps(vs))
 
@@ -508,6 +509,71 @@ def case_blank_gap() -> None:
     print(
         f"  [OK] 跨过 {gap_end - gap_start}px 留白：拼出 {got.shape[0]} 行"
         f"（{res.pages} 页），末尾与原文对齐 MAD={diff:.2f}"
+    )
+
+
+def case_stop_mode() -> None:
+    """同一个文档、同一片留白，两种「停止条件」必须真的分叉。
+
+    这是用户 2026-10-28 要求的开关，判据不同、动作也必须不同：
+
+        scroll（默认）  只投滚轮。画面不再变化就收尾 —— 不反向确认、不放步长，
+                        留白区整帧照搬（没有结构就没有缝，不需要估算高度）。
+        auto            判定「是否已完成」。滚不动时向上滚一格反向确认、
+                        把留白按估计高度补回版面。
+
+    如果两种模式只是多了个参数而行为一样，这个开关就是假的 —— 所以这里
+    分别断言两边的**收尾话术**和**采集行数**。
+    """
+    doc = M.make_document(width=800, height=9000, seed=5)
+    gap_start, gap_end = 3000, 5500
+    doc[gap_start:gap_end] = 252           # 2.5 屏纯白
+    view_h = 600
+
+    def one(stop_mode: str, name: str) -> tuple[np.ndarray, str, list[str]]:
+        vs = M.VirtualScreen(doc, view_h, unit_px=100)
+        notes: list[str] = []
+        cfg = CaptureConfig(
+            region=(0, 0, 800, view_h), out_path=OUT / name, keep_temp=True,
+            stop_mode=stop_mode,
+        )
+        res = run(cfg, on_progress=lambda f, p, r, n: notes.append(n), deps=make_deps(vs))
+        assert res.ok, res.message
+        return load_pages(res.temp_dir), res.message, notes
+
+    # ---- scroll：滚不动就停 ----
+    got_scroll, msg_scroll, notes_scroll = one("scroll", "stop_scroll.pdf")
+    assert "无法继续向下滚动" in msg_scroll, msg_scroll
+    assert "已滚动到底部" not in msg_scroll, (
+        "scroll 模式不该走「反向滚一格确认」那条路：" + msg_scroll
+    )
+    assert "空白区" in msg_scroll, (
+        "停在空白上必须明说一句，否则用户分不清「真到底」和「只是留白」：" + msg_scroll
+    )
+    assert any("整帧追加" in n for n in notes_scroll), "进入留白时没有按整帧追加处理"
+    # 留白之前的正文必须一行不少（停得早可以，丢内容不行）
+    assert got_scroll.shape[0] >= gap_start, (
+        f"留白之前就少了内容：只拼到 {got_scroll.shape[0]} 行（留白从 {gap_start} 开始）"
+    )
+    # 这个模式的代价就是「停在留白入口」，这里把它钉住：哪天悄悄变成穿过去了，
+    # 说明两个模式又混成一个了。
+    assert got_scroll.shape[0] < gap_end, (
+        f"scroll 模式不该穿过留白（拼到 {got_scroll.shape[0]} 行，留白到 {gap_end}）"
+    )
+    print(
+        f"  [OK] scroll：停在留白入口 {got_scroll.shape[0]} 行，"
+        f"且明确提示「{msg_scroll.split('。')[-1][:22]}…」"
+    )
+
+    # ---- auto：自动判断完成 ----
+    got_auto, msg_auto, notes_auto = one("auto", "stop_auto.pdf")
+    assert "已滚动到底部" in msg_auto or "留白" in msg_auto, msg_auto
+    assert any(("留白" in n or "空白" in n) and "整帧追加" not in n
+               for n in notes_auto), "auto 模式没有报告穿越留白的过程"
+    assert got_auto.shape[0] > gap_end, got_auto.shape[0]
+    print(
+        f"  [OK] auto  ：穿过留白到 {got_auto.shape[0]} 行，"
+        f"收尾话术「{msg_auto.splitlines()[0]}」"
     )
 
 
@@ -556,6 +622,7 @@ def main() -> int:
     case_manual_idle_finish()
     case_manual_upward_scroll()
     case_blank_gap()
+    case_stop_mode()
     case_output_dedup()
     print("全部通过")
     return 0

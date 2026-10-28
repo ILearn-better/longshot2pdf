@@ -129,6 +129,45 @@ _clicked = {"v": False}
 _orig_update = tkinter.Misc.update
 _orig_tk = tkinter.Tk
 
+# 「停止条件」那组控件的现场观测结果，交给 main() 参与判定
+UI: dict = {}
+
+
+def probe_stop_mode(root) -> None:
+    """点「开始」之前，先验一遍「停止条件」这个开关。
+
+    要验三件事，任何一件错了用户就控制不了行为：
+      1. 两个选项都在（滚不动就停 / 自动判断完成）；
+      2. 默认是「滚不动就停」—— 用户要的是「自动滚动 = 替我按滚轮」；
+      3. 切到手动滚动时置灰（手动模式的收尾靠 idle_timeout，这个开关无意义）。
+    """
+    radios: dict[str, object] = {}
+    for w in walk(root):
+        if isinstance(w, tkinter.ttk.Radiobutton):
+            try:
+                radios[str(w.cget("text"))] = w
+            except tkinter.TclError:
+                pass
+    UI["labels"] = sorted(radios)
+    if "滚不动就停" not in radios or "自动判断完成" not in radios:
+        UI["error"] = f"没找到两个选项，只有 {sorted(radios)}"
+        return
+
+    scroll_rb = radios["滚不动就停"]
+    manual_rb = next(
+        (w for t, w in radios.items() if t.startswith("手动")), None
+    )
+    var_name = str(scroll_rb.cget("variable"))
+    UI["default"] = str(root.getvar(var_name))
+
+    if manual_rb is not None:
+        manual_rb.invoke()
+        UI["disabled_in_manual"] = bool(scroll_rb.instate(["disabled"]))
+        # 切回自动，后面还要正常走一遍采集流程
+        next(w for t, w in radios.items() if t == "自动").invoke()
+        UI["enabled_back"] = not bool(scroll_rb.instate(["disabled"]))
+        UI["value_after_switch"] = str(root.getvar(var_name))
+
 
 def make_root(*a, **k):
     r = _orig_tk(*a, **k)
@@ -137,10 +176,11 @@ def make_root(*a, **k):
 
 
 def pump_update(self):
-    """第一次 update 时界面已建好 —— 在这里点「框选」再点「开始」。"""
+    """第一次 update 时界面已建好 —— 在这里验开关、点「框选」再点「开始」。"""
     if "root" in _created and not _clicked["v"]:
         _clicked["v"] = True
         root = _created["root"]
+        probe_stop_mode(root)
         sel = find_button(root, "框选区域")
         start = find_button(root, "开始")
         if sel is None or start is None:
@@ -199,6 +239,16 @@ def main() -> int:
         return "-" if t is None else f"{t:.2f}s"
 
     checks: list[tuple[str, bool, str]] = [
+        ("停止条件：两个选项都在",
+         "滚不动就停" in UI.get("labels", []) and "自动判断完成" in UI.get("labels", []),
+         UI.get("error") or "、".join(UI.get("labels", []))),
+        ("停止条件：默认「滚不动就停」", UI.get("default") == "scroll",
+         f"默认值 {UI.get('default')}"),
+        ("停止条件：手动模式下置灰", bool(UI.get("disabled_in_manual")), ""),
+        # 切回自动滚动后，用户上次选的「停止条件」不该被重置
+        ("停止条件：切回自动后恢复可选且保留选择",
+         bool(UI.get("enabled_back")) and UI.get("value_after_switch") == "scroll",
+         f"值 {UI.get('value_after_switch')}"),
         ("点了开始", t_click is not None, ""),
         ("最小化发生在点击之后", bool(t_icon and t_click and t_icon > t_click),
          f"{fmt(t_click)} → {fmt(t_icon)}"),
